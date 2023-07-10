@@ -1,0 +1,1229 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+## Set directory
+
+```{r}
+
+knitr::opts_knit$set(root.dir = "C:/Users/Max/Documents/Pixelgen/Projects/2023-technical-manuscript/")
+
+```
+
+
+## Load packages 
+
+```{r message=FALSE, warning=FALSE, include=TRUE}
+
+# Framework packages
+library(tidyverse)
+library(Seurat)
+
+# Visualization packages
+library(patchwork)
+library(viridis)
+library(ggforce)
+library(pheatmap)
+library(plotly)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(graphlayouts)
+library(ggplotify)
+
+# Statistics packages
+library(ggpubr)
+library(rstatix)
+library(broom)
+
+# Utility packages
+library(pbapply)
+
+source("scripts/utility.R")
+source("scripts/theme.R")
+
+```
+
+
+## Manage data
+
+First, we convert the .pxl AnnData files to Seurat format, so we can use the standard Seurat functions for data analysis.  
+
+### Convert pxl Anndata files
+
+```{r}
+# The folders the data is located in:
+data_folders <- 
+  c("C:/Users/Max/data/pixelgen/PGseq97/0.12.0/analysis/",
+    "C:/Users/Max/data/pixelgen/PGseq95/0.12.0/analysis/")
+
+
+# Create data frame containing data file information
+data_files <-
+  data_folders %>% 
+  list.files(full.names = T,
+             recursive = T) %>% 
+  enframe("i", "filename") %>% 
+  filter(str_detect(filename, "dataset.pxl$"))  %>% 
+  mutate(dataset = str_extract(filename, "PGseq\\d{1,2}"),
+         full_id = str_remove(filename, ".*\\/") %>% 
+           str_remove("\\..*"),
+         sample =  str_extract(full_id, "_S\\d_") %>% 
+           str_remove_all("_"),
+         rds_file = paste0(filename, ".rds")) %>% 
+  filter((dataset == "PGseq97" & str_detect(full_id, "Raji")) |
+           (dataset == "PGseq95" & str_detect(full_id, "CD3|unstimulated")))
+  
+# Save file meta data
+
+data_files %>% 
+  write_csv("results/polarization/data files.csv")
+
+# Convert each .pxl AnnData file to Seurat and save an .rds file 
+# that is easily loaded in R
+for(i in 1:nrow(data_files)) {
+  
+  filename = data_files$filename[i]
+  newfilename = data_files$rds_file[i]
+  message(paste("Converting:", filename))
+  
+  if(file.exists(newfilename)) {
+    message("Converted file already exists\n")
+    next
+  }
+  
+  convert_pixelgenh5_seuratrds(filename, newfilename)
+}
+```
+
+### Define meta data
+
+Create a data frame containing meta data. 
+
+```{r}
+
+# Create a meta data table from the data file information
+meta_data <-
+  data_files %>% 
+  select(sample, dataset, full_id) %>% 
+  mutate(stimulation = case_when(str_detect(full_id, "Rituximab") ~ "Rituximab",
+                                 str_detect(full_id, "CD3") ~ "CD3 capping", 
+                                 T ~ "Control"),
+         experiment = case_when(str_detect(full_id, "Raji") ~ "Rituximab",
+                            T ~ "CD3"),
+         sample_type = case_when(str_detect(full_id, "control|unstimulated") ~ "Control",
+                            T ~ "Stimulated"),
+         full_condition = paste(experiment, sample_type))
+
+# Save meta data
+meta_data %>% 
+  write_csv("results/polarization/polarization meta data.csv")
+
+
+```
+
+
+### AnnData file
+
+The AnnData file is stored in the .dataset.pxl file, and we previously converted it to a Seurat object and saved it as .rds to make it easy to retrieve. 
+
+```{r message=FALSE, warning=FALSE}
+# AnnData
+pg_data <- 
+  data_files %>% 
+  select(sample, rds_file) %>% 
+  deframe() %>% 
+  lapply(readRDS)
+```
+
+We extract the component meta data and put it in a separate data frame for easy access. 
+
+```{r message=FALSE, warning=FALSE}
+# Metrics
+metrics_data <- 
+  pg_data %>% 
+  map(. %>% 
+        {.@meta.data} %>% 
+        as_tibble(rownames = "component")) %>% 
+  bind_rows(.id = "sample")
+```
+
+### Edge list
+
+The edge list contains the whole Molecular Pixelation graph, where each row corresponds to a unique read, and an edge in the bipartite graph. It has been used for previous stages such as multiplet recovery, polarization, and colocalization score calculations. 
+
+```{r message=FALSE, warning=FALSE}
+# Edgelists
+# edgelists <-
+#   data_files %>%
+#   with(set_names(filename, sample)) %>%
+#   pblapply(read_edgelist)
+```
+
+### Polarization scores
+
+The polarization and colocalization score files are tables of statistics calculated to estimate the spatial properties of markers in each individual component. 
+The polarization score consists of Moran's I, which estimates the degree of non-random spatial distribution, where high score indicates more spatial structure. 
+
+```{r message=FALSE, warning=FALSE}
+# Polarity scores
+loc_scores <-
+  data_files %>%
+  with(set_names(filename, sample)) %>%
+  pblapply(read_pixeldata_item, items = c("polarization"))
+
+```
+
+### Analysis settings
+
+```{r}
+# Define some of the most important qc metrics for evaluating components
+metrics_of_interest <- 
+  c("edges", "umi_per_upia", "mean_reads")
+
+# Define some filters for refining cell calling
+component_filters <- 
+  list(minimum_edges = c("CD3" = 5000, "Rituximab" = 20000), 
+       minimum_edge_rank = 11)
+
+
+```
+
+# Quality Control
+
+Here we perform a quality control of the called cells, i.e. the components that have been labeled as real cells. This entails a manual refinement of the cell calling based on measured cell size by number of edges (number of unique detected antibodies), as well as removal of technical outliers. 
+
+## Edge rank plot
+
+The edge rank plot is used to call cells in a previous cell calling step in Pixelator. Here, we inspect it again and apply additional filters to remove cells that deviate from the component size distribution.
+
+In this plot, the used cutoffs are marked as dashed lines, and components that are deviating more than two standard deviations from the mean (number of edges) are marked in gray. 
+
+```{r}
+plot_data <- 
+  metrics_data %>% 
+  group_by(sample) %>% 
+  mutate(rank = rank(-edges, ties.method = "random")) %>% 
+  left_join(meta_data,
+             by = "sample") %>% 
+  ungroup()
+
+plot_data %>% 
+  ggplot(aes(rank, edges, color = sample_type)) +
+  geom_point(size = 0.5) +
+  geom_hline(data = component_filters$minimum_edges %>% 
+               enframe("experiment", "limit"),
+             aes(yintercept = limit),
+             linetype = "dashed") +
+  geom_vline(xintercept = component_filters$minimum_edge_rank,
+             linetype = "dashed") +
+  facet_wrap(~experiment) +
+  scale_y_log10() +
+  scale_x_log10() +
+  labs(x = "Component rank (by number of edges)",
+       y = "Number of edges") +
+  theme_pg() 
+
+ggsave("results/polarization/edge rank plot.png",
+       width = 9, height = 5)
+
+```
+
+Here we make a table saving the information of which cells we want to keep for further analysis.
+
+```{r}
+called_cells <-
+  plot_data %>% 
+  left_join(component_filters$minimum_edges %>% 
+               enframe("experiment", "limit")) %>% 
+  filter(edges >= limit,
+         rank >= component_filters$minimum_edge_rank)
+
+cat(paste("Out of", nrow(plot_data), "cells,", nrow(called_cells), "were called."))
+
+```
+
+Here we plot the number of called cells per condition and replicate. The target of 500 cells is marked as a dashed line. 
+
+```{r}
+
+
+called_cells %>% 
+  group_by(sample) %>% 
+  count() %>% 
+  left_join(meta_data,
+            by = c("sample")) %>% 
+  ggplot(aes(sample, n)) +
+  geom_hline(data = tibble(yintercept = c(500, 1000),
+                           experiment = c("CD3", "Rituximab")),
+             aes(yintercept = yintercept),
+             linetype = "dashed") +
+  geom_col(position = position_dodge()) +
+  geom_text(aes(label = n),
+            vjust = -0.5) +
+  scale_y_continuous(expand = expansion(c(0, 0.1))) +
+  facet_grid(~experiment, scales = "free_x", space = "free") +
+  theme_pg() +
+  theme(panel.border = element_blank()) +
+  labs(title = "Number of called cells")
+ggsave("results/polarization/nbr called cells.png",
+       width = 4, height = 3)
+
+
+```
+
+# Inspect component metrics
+
+## Metrics of interest
+
+```{r}
+
+metrics_data %>% 
+  inner_join(called_cells %>% 
+               select(sample, component),
+             by = c("sample", "component")) %>% 
+  select(1, 2, all_of(metrics_of_interest)) %>% 
+  gather(metric, value, -1, -2) %>% 
+  left_join(meta_data, 
+            by = "sample") %>% 
+  ggplot(aes(sample, value, fill = experiment)) +
+  geom_violin(draw_quantiles = 0.5) + 
+  facet_grid(metric ~ full_condition + sample, scales = "free") +
+  scale_y_log10() +
+  theme_pg()
+ggsave("results/polarization/metrics of interest violin.png",
+       width = 10, height = 7)
+
+
+
+```
+
+## Pixel content vs Marker specificity
+
+Rarily, antibodies form aggregates, which manifest themselves as outliers in Molecular Pixelation data. These usually have either high complexity, consisting of many random antibodies, or low complexity, mainly constituting a single antibody. We detect these by using a metric Tau, which ranges from 0, indicating equal distribution of counts across all antibodies, to 1, indicating all counts distributed to a single antibody. Additionally, aggregates often have dense pixels with a lot of antibodies detected per each pixel, which can be measured using the umi_per_upia metric, which is stored in the component meta data.
+
+Here we have plotted umi_per_upia against Tau, and colored each component by Pixelator's classification of Tau (low, normal, or high). It looks like Pixelator has accurately picked out a few outliers that might be antibody aggregates or components that has low specificity, binding many more different types of antibodies than we would expect from a normal cell. We will remove these from the analysis as well.  
+
+```{r}
+metrics_data %>% 
+  inner_join(called_cells %>% 
+               select(sample, component),
+             by = c("sample", "component")) %>% 
+  left_join(meta_data,
+            by = c("sample")) %>% 
+  ggplot(aes(tau, umi_per_upia, color = tau_type)) +
+  geom_point() +
+  theme_pg() +
+  facet_grid(experiment ~ sample_type) +
+  scale_y_log10() +
+  scale_color_manual(values = c("high" = "orangered2", "low" = "skyblue3", "normal" = "gray")) +
+  labs(x = "Marker specificity (Tau)",
+       y = "Pixel content (UMI/UPIA)")
+ggsave("results/polarization/tau vs pixel content.png",
+       width = 10, height = 7)
+
+
+```
+
+Here we save a data frame with the cells that are deemed normal. 
+
+```{r}
+
+cleaned_cells <-
+  called_cells %>% 
+  filter(tau_type == "normal")
+
+cat(paste("Out of", nrow(called_cells), "cells,", nrow(cleaned_cells), "were kept"))
+```
+
+
+# Clean data
+
+## Select features
+
+Some markers are unused barcodes (named e.g. BC11 in the data). Let's select only markers we are using in the assay.
+
+```{r}
+
+marker_types <-
+  pg_data %>% 
+  map(. %>% 
+        {.@assays$RNA@counts} %>% 
+        rownames() %>% 
+        enframe("i", "marker")) %>% 
+  bind_rows(.id = "experiment") %>% 
+  mutate(marker_type = case_when(str_detect(marker, "^BC\\d") ~ "Empty BC",
+                                 str_detect(marker, "^mIgG") ~ "Isotype ctrl",
+                                 T ~ "Normal")) %>% 
+  select(-i, -experiment) %>% 
+  distinct()
+
+selected_features <-
+  marker_types %>% 
+  filter(marker_type != "Empty BC") %>% 
+  pull(marker) 
+
+selected_features %>% 
+  sort() %>% 
+  paste(collapse = ", ") %>% 
+  cat()
+
+
+pca_features <- 
+  marker_types %>% 
+  filter(marker_type == "Normal") %>% 
+  filter(!marker %in% c("TCRb", "CD41", "CD9", "CD36", "CD29", "ACTB", "CD62P")) %>% 
+  pull(marker)
+
+```
+
+
+## Remove cells and empty barcodes
+
+Here we filter the data to only keep the cells we have selected, and the markers that we selected in the previous step. 
+
+```{r}
+
+keep_cells <- 
+  cleaned_cells %>% 
+  mutate(cell_id = paste(sample, component, sep = "_")) %>% 
+  split(.$experiment)
+
+# Merge Seurat objects 
+pg_data_comb <- 
+  list(CD3 = merge(pg_data$S1,
+                   y = c(pg_data$S2, pg_data$S7, pg_data$S8),
+                   add.cell.ids = c("S1", "S2", "S7", "S8")),
+       Rituximab = merge(pg_data$S4,
+                         y = pg_data$S5,
+                         add.cell.ids = c("S4", "S5")))
+
+
+
+# Keep only cells and features we have selected previously
+pg_data_comb[["CD3"]][["cell_id"]] <- colnames(pg_data_comb$CD3)
+pg_data_comb[["Rituximab"]][["cell_id"]] <- colnames(pg_data_comb$Rituximab)
+
+pg_data_comb$CD3 <- 
+  pg_data_comb$CD3 %>% 
+  subset(subset = cell_id %in% keep_cells$CD3$cell_id) %>% 
+  subset(features = selected_features)
+
+pg_data_comb$Rituximab <- 
+  pg_data_comb$Rituximab %>% 
+  subset(subset = cell_id %in% keep_cells$Rituximab$cell_id) %>% 
+  subset(features = selected_features)
+
+```
+
+
+# Analysis (all cells)
+
+## Select features
+
+```{r}
+selected_markers <- 
+  pg_data_comb %>% 
+  map(. %>% 
+        {.@assays$RNA@counts} %>% 
+        rownames() %>%  
+        enframe()) %>% 
+  bind_rows(.id = "experiment") %>% 
+  mutate(selected = !(str_detect(name, "^mIg"))) %>% 
+  select(-experiment, -name) %>% 
+  distinct()
+
+```
+
+
+
+## Data processing
+
+```{r}
+
+
+pg_data_comb_processed <- 
+  pg_data_comb %>% 
+  map(. %>% 
+        
+        # log transform data: 
+        NormalizeData(normalization.method = "CLR", margin = 2) %>%
+        
+        subset(features = selected_markers$name[which(selected_markers$selected)]) %>% 
+        
+        # Find variable features
+        FindVariableFeatures(nfeatures = 40, ) %>% 
+        
+        # Scale data 
+        ScaleData(scale.max = Inf, 
+                  do.scale = T, 
+                  do.center = T, 
+                  verbose = F) %>% 
+        RunPCA(npcs = 30, features = pca_features) %>% 
+        RunUMAP(umap.method = "uwot",
+                min.dist = 0.1,
+                spread = 2,
+                n.neighbors = 25,
+                dims = 1:12))
+      
+
+VariableFeaturePlot(pg_data_comb_processed$CD3, selection.method = "vst") +
+  geom_text(data = . %>% 
+              as_tibble(rownames = "marker"),
+            aes(label = marker, color = colors),
+            size = 2,
+            vjust = -0.5) +
+   theme(plot.background = element_rect(fill = "white", color = NA)) +
+  
+VariableFeaturePlot(pg_data_comb_processed$Rituximab, selection.method = "vst") +
+  geom_text(data = . %>% 
+              as_tibble(rownames = "marker"),
+            aes(label = marker, color = colors),
+            size = 2,
+            vjust = -0.5) +
+   theme(plot.background = element_rect(fill = "white", color = NA))
+ggsave("results/polarization/variable variance plot.png",
+       width = 12, height = 4)
+pg_data_comb_processed$CD3@reductions$pca@stdev
+pg_data_comb_processed$Rituximab@reductions$pca@stdev
+
+umap_data <- 
+  pg_data_comb_processed %>% 
+  map(. %>% 
+        {.@reductions$umap@cell.embeddings} %>% 
+        as_tibble(rownames = "sample_component") %>% 
+        separate(sample_component, into = c("sample", "component"), remove = F)) %>% 
+  bind_rows(.id = "experiment") %>% 
+  left_join(meta_data) %>% 
+  left_join(metrics_data)
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = sample_type)) +
+  geom_point(size = 0.1) + 
+  coord_fixed() +
+  theme_umap() +
+  facet_wrap(~experiment)
+ggsave("results/polarization/UMAP sample.png",
+       width = 8, height = 3)
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2)) +
+  geom_point(data = . %>% 
+               select(-sample_type),
+             color = "gray", 
+             size = 0.5) + 
+  geom_point(size = 0.1,
+             color = "orangered") + 
+  coord_fixed() +
+  facet_grid(experiment ~ sample_type) +
+  theme_umap()
+ggsave("results/polarization/UMAP sample separated.png",
+       width = 8, height = 5)
+
+
+
+
+
+FeaturePlot(pg_data_comb_processed$CD3,
+            coord.fixed = T,
+            features = c("CD4",
+                         "CD3E",
+                         "CD8")) 
+
+FeaturePlot(pg_data_comb_processed$Rituximab,
+            coord.fixed = T,
+            features = c("CD4",
+                         "CD3E",
+                         "CD8"))
+
+
+FeaturePlot(pg_data_comb_processed$CD3, 
+            coord.fixed = T,
+            features = c("B2M",
+                         "CD45",
+                         "HLA-ABC",
+                         "tau"))
+
+FeaturePlot(pg_data_comb_processed$Rituximab, 
+            coord.fixed = T,
+            features = c("B2M",
+                         "CD45",
+                         "HLA-ABC",
+                         "tau"))
+
+
+FeaturePlot(pg_data_comb_processed$CD3, 
+            coord.fixed = T,
+            features = c("mIgG1",
+                         "mIgG2a",
+                         "mIgG2b",
+                         "ACTB"))
+
+FeaturePlot(pg_data_comb_processed$Rituximab, 
+            coord.fixed = T,
+            features = c("mIgG1",
+                         "mIgG2a",
+                         "mIgG2b",
+                         "ACTB"))
+
+
+FeaturePlot(pg_data_comb_processed$CD3, 
+            coord.fixed = T,
+            features = c("CD18",
+                         "CD16",
+                         "CD14",
+                         "CD11a"))
+
+FeaturePlot(pg_data_comb_processed$Rituximab, 
+            coord.fixed = T,
+            features = c("CD18",
+                         "CD16",
+                         "CD14",
+                         "CD11a"))
+
+FeaturePlot(pg_data_comb_processed$CD3, 
+            coord.fixed = T,
+            features = c("CD19",
+                         "CD20",
+                         "CD40"))
+
+FeaturePlot(pg_data_comb_processed$Rituximab, 
+            coord.fixed = T,
+            features = c("CD19",
+                         "CD20",
+                         "CD40"))
+
+
+FeaturePlot(pg_data_comb_processed$CD3, 
+            coord.fixed = T,
+            features = c("CD38",
+                         "CD54",
+                         "CD43", 
+                         "CD50"))
+
+FeaturePlot(pg_data_comb_processed$Rituximab, 
+            coord.fixed = T,
+            features = c("CD38",
+                         "CD54",
+                         "CD43",
+                         "CD50"))
+
+
+
+```
+
+
+## Gate-filter cells
+
+```{r}
+#perform some filtering based on scaled count levels to only retain T cells/Raji cells and remove some duplets
+
+gate_data <- 
+  pg_data_comb_processed %>% 
+  map(. %>% 
+        {.@assays$RNA@data} %>% 
+        as_tibble(rownames = "marker") %>% 
+        gather(sample_component, scaled_data, -1)) %>% 
+  bind_rows(.id = "experiment")
+
+cell_gates <- 
+  list(CD3 =
+         c(CD3E = 0.9,
+           CD4 = 1.8,
+           CD8 = 1.5,
+           CD19 = 0.5,
+           CD20 = 1.1,
+           CD14 = 0.5))
+
+gate_data <- 
+  gate_data %>% 
+  inner_join(cell_gates %>% 
+               map(. %>% 
+                     enframe("marker", "limit")) %>% 
+               bind_rows(.id = "experiment") )
+
+gate_data %>% 
+  filter(experiment == "CD3") %>% 
+  ggplot(aes(scaled_data)) +
+  geom_histogram(bins = 50) +
+  geom_vline(data = cell_gates$CD3 %>% 
+              enframe("marker", "limit"),
+             aes(xintercept = limit),
+             linetype = "dashed") +
+  facet_grid(marker~ . ,
+             scales = "free") +
+  theme_pg()
+ggsave("results/polarization/T cell gates.png",
+       width = 8, height = 8)
+ggsave("results/polarization/T cell gates.pdf",
+       width = 8, height = 8)
+
+CD3_gated_cells <- 
+  pg_data_comb_processed$CD3@assays$RNA@data %>% 
+  as.matrix() %>% 
+  t() %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  filter(CD3E > cell_gates$CD3[["CD3E"]]) %>% 
+  filter(CD4 > cell_gates$CD3[["CD4"]] | 
+           CD8 > cell_gates$CD3[["CD8"]]) %>% 
+  filter(CD19 < cell_gates$CD3[["CD19"]]) %>% 
+  filter(CD20 < cell_gates$CD3[["CD20"]]) %>% 
+  filter(CD14 < cell_gates$CD3[["CD14"]]) %>% 
+  pull(sample_component)
+
+
+```
+
+## Differential polarity analysis
+
+### Prep data
+
+```{r}
+polarity_score <- 
+  loc_scores %>% 
+  bind_rows(.id = "sample") %>% 
+  left_join(meta_data) %>% 
+  inner_join(cleaned_cells %>% select(sample, component)) %>% 
+  filter(!str_detect(marker, "^BC" ))
+```
+
+
+### CD3
+
+```{r}
+
+
+temp_test_data <- 
+  polarity_score %>%
+  filter(experiment == "CD3") %>% 
+  filter(paste(sample, component, sep = "_") %in% CD3_gated_cells) %>% 
+  filter(!str_detect(marker, "^BC" ))
+
+set.seed(0)
+cd3_polarization_wilcox_res <-
+  temp_test_data %>% 
+  group_by(sample_type, marker) %>% 
+  slice(sample(1:length(component), min(length(component), 50))) %>% 
+  ungroup() %>% 
+  nest_by(marker) %>% 
+  summarise(wilcox_res = list(wilcox_test(data = data,
+                                          morans_i  ~ sample_type, 
+                                          ref.group = "Control",
+                                          detailed = T) %>% 
+                                add_xy_position(step.increase = 0.2))) %>% 
+  unnest(wilcox_res) %>% 
+  ungroup() %>% 
+  mutate(p.adj = p.adjust(p, method = "bonferroni")) %>% 
+  ungroup() %>% 
+  add_significance(p.col = "p.adj") %>% 
+  mutate(estimate = -estimate)
+
+cd3_polarization_wilcox_res %>% 
+  write_csv("results/polarization/CD3 pol wilcox res.csv")
+
+cd3_polarization_wilcox_res %>% 
+  arrange(p.adj) %>% 
+  ggplot(aes(estimate, -log10(p.adj))) +
+  
+  geom_vline(xintercept = 0, color = "gray") +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") +
+  geom_point(size = 0.01) +
+  ggrepel::geom_text_repel(data = . %>% 
+                             filter(p.adj < 0.05),
+                           aes(label = marker),
+                           size = 3) +
+  scale_y_continuous(expand = expansion(c(0, 0.05))) +
+  theme_pg()
+ggsave("results/polarization/CD3 volcano.pdf",
+       width = 4, height = 4)
+
+p1 <- 
+  temp_test_data %>% 
+  filter(marker %in% c("CD3E", "CD2", "CD45")) %>% 
+  mutate(marker = factor(marker, c("CD3E", "CD2", "CD45"))) %>% 
+  ggplot(aes(sample_type, morans_i)) +
+  geom_hline(yintercept = 0, color = "gray") +
+  geom_violin(aes(fill = sample_type),
+              draw_quantiles = 0.5,
+              scale = "width",
+              stroke = 0.1) +
+  geom_jitter(size = 0.1,
+              alpha = 0.25,
+              color = "black") +
+  stat_pvalue_manual(data = cd3_polarization_wilcox_res %>% 
+                       filter(marker %in% c("CD3E", "CD2", "CD45")) %>% 
+                       mutate(marker = factor(marker, c("CD3E", "CD2", "CD45"))), 
+                     
+                     y.position = 0.55,
+                     label = "p.adj.signif") +
+  # stat_pvalue_manual(data = cd3_polarization_wilcox_res) +
+  # stat_compare_means() +
+  scale_fill_manual(values = c("Control" = "gray",
+                               "Stimulated" = "coral2")) +
+  scale_y_continuous(expand = expansion(0),
+                     limits = c(-0.1, 0.6)) +
+  facet_grid( ~ marker) +
+  theme_pg() +
+  theme(panel.spacing = unit(0, "mm"))
+p1
+ggsave("results/polarization/CD3 violin.pdf",plot = p1,
+       width = 6, height = 3)
+
+```
+
+### CD20
+
+```{r}
+
+
+temp_test_data <- 
+  polarity_score %>%
+  filter(sample %in% c("S4", "S5")) %>%  
+  filter(!(marker == "CD20" & sample_type == "Stimulated")) %>% 
+  filter(!(marker == "Rituximab" & sample_type == "Control")) %>% 
+  mutate(marker =ifelse(marker == "Rituximab",
+                        "CD20",
+                        marker))
+
+set.seed(0)
+cd20_polarization_wilcox_res <-
+  temp_test_data %>% 
+  group_by(sample_type, marker) %>% 
+  slice(sample(1:length(component), min(length(component), 50))) %>% 
+  ungroup() %>% 
+  nest_by(marker) %>% 
+  summarise(wilcox_res = list(wilcox_test(data = data,
+                                          morans_i  ~ sample_type, 
+                                          ref.group = "Control",
+                                          detailed = T) %>% 
+                                add_xy_position(step.increase = 0.2))) %>% 
+  unnest(wilcox_res) %>% 
+  ungroup() %>% 
+  mutate(p.adj = p.adjust(p, method = "bonferroni")) %>% 
+  ungroup() %>% 
+  add_significance(p.col = "p.adj") %>% 
+  mutate(estimate = -estimate)
+
+cd20_polarization_wilcox_res %>% 
+  write_csv("results/polarization/CD20 pol wilcox res.csv")
+
+cd20_polarization_wilcox_res %>% 
+  arrange(p.adj) %>% 
+  ggplot(aes(estimate, -log10(p.adj))) +
+  
+  geom_vline(xintercept = 0, color = "gray") +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") +
+  geom_point(size = 0.01) +
+  ggrepel::geom_text_repel(data = . %>% 
+                             filter(p.adj < 0.05),
+                           aes(label = marker),
+                           size = 3) +
+  scale_y_continuous(expand = expansion(c(0, 0.05))) +
+  theme_pg()
+ggsave("results/polarization/CD20 volcano.pdf",
+       width = 4, height = 4)
+
+p2 <- 
+  temp_test_data %>% 
+  filter(marker %in% c("CD20", "HLA-DR", "CD82")) %>% 
+  mutate(marker = factor(marker, c("CD20", "HLA-DR", "CD82"))) %>% 
+  ggplot(aes(sample_type, morans_i)) +
+  geom_hline(yintercept = 0, color = "gray") +
+  geom_violin(aes(fill = sample_type),
+              draw_quantiles = 0.5,
+              scale = "width",
+              stroke = 0.1) +
+  geom_jitter(size = 0.1,
+              alpha = 0.25,
+              color = "black") +
+  stat_pvalue_manual(data = cd20_polarization_wilcox_res %>% 
+                       filter(marker %in% c("CD20", "HLA-DR", "CD82")) %>% 
+                       mutate(marker = factor(marker, c("CD20", "HLA-DR", "CD82"))), 
+                     y.position = 0.55,
+                     
+                     label = "p.adj.signif") +
+  scale_fill_manual(values = c("Control" = "gray",
+                               "Stimulated" = "coral2")) +
+  scale_y_continuous(expand = expansion(0),
+                     limits = c(-0.1, 0.6)) +
+  facet_grid( ~ marker) +
+  theme_pg() +
+  theme(panel.spacing = unit(0, "mm"))
+p2
+ggsave("results/polarization/CD20 violin.pdf",plot = p2,
+       width = 6, height = 3)
+
+```
+
+###Combined plot
+
+```{r}
+
+p1 / p2
+
+ggsave("results/polarization/Combo violin.pdf",
+       width = 6, height = 6)
+
+```
+
+
+## Plots of all markers
+
+```{r}
+
+plot_markers <- 
+  pg_data_comb_processed$Rituximab@assays$RNA@counts %>%
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, counts, -1) %>%
+  mutate(sample_type = str_remove(sample_component, "_.*")) %>% 
+  filter(!(marker == "CD20" & sample_type == "Stimulated")) %>% 
+  filter(!(marker == "Rituximab" & sample_type == "Control")) %>% 
+  mutate(marker =ifelse(marker == "Rituximab",
+                        "CD20",
+                        marker)) %>% 
+  group_by(marker) %>% 
+  summarise(counts = sum(counts)) %>% 
+  arrange(counts) %>% 
+  filter(counts > max(counts[which(str_detect(marker, "^mIg"))])) %>% 
+  pull(marker)
+  
+
+
+p1 <- 
+  polarity_score %>% 
+  filter(!(marker == "CD20" & sample_type == "Stimulated")) %>% 
+  filter(!(marker == "Rituximab" & sample_type == "Control")) %>% 
+  mutate(marker =ifelse(marker == "Rituximab",
+                        "CD20",
+                        marker)) %>% 
+  filter(marker %in% plot_markers) %>% 
+  filter(experiment == "Rituximab") %>% 
+  ggplot(aes(marker, morans_i)) +
+  geom_hline(yintercept = 0, color = "gray") +
+  geom_boxplot(aes(fill = sample_type),
+              outlier.size = 0.1) +
+  scale_fill_manual(values = c("Control" = "gray",
+                               "Stimulated" = "coral2")) +
+  scale_y_continuous(expand = expansion(0),
+                     limits = c(-0.1, 1)) +
+  theme_pg() +
+  theme(panel.spacing = unit(0, "mm"),
+        axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = "",
+       y = "Moran's I",
+       title = "CD20-Rituximab")
+
+plot_markers <- 
+  pg_data_comb_processed$CD3@assays$RNA@counts %>%
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, counts, -1) %>%
+  group_by(marker) %>% 
+  summarise(counts = sum(counts)) %>% 
+  arrange(counts) %>% 
+  filter(counts > max(counts[which(str_detect(marker, "^mIg"))])) %>% 
+  pull(marker)
+  
+p2 <- 
+  polarity_score %>% 
+  filter(experiment == "CD3") %>% 
+  filter(marker %in% plot_markers) %>% 
+  ggplot(aes(marker, morans_i)) +
+  geom_hline(yintercept = 0, color = "gray") +
+  geom_boxplot(aes(fill = sample_type),
+              outlier.size = 0.1) +
+  scale_fill_manual(values = c("Control" = "gray",
+                               "Stimulated" = "coral2")) +
+  scale_y_continuous(expand = expansion(0),
+                     limits = c(-0.1, 1)) +
+  theme_pg() +
+  theme(panel.spacing = unit(0, "mm"),
+        axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = "",
+       y = "Moran's I",
+       title = "CD3 capping")
+
+
+p2 / p1
+
+ggsave("results/polarization/CD20 CD3 all violins.pdf", 
+       width = 10.5, height = 7)
+```
+
+
+# Visualize some components
+
+```{r}
+
+
+plot_markers <- 
+  c("CD3E", "CD2", "CD45", "CD20", "HLA-DR", "CD82")
+
+plot_components <- 
+  c("S5" = "RCVCMP0000239",
+    "S7" = "RCVCMP0000001")
+
+
+edgelists <-
+  data_files %>%
+  filter(sample %in% names(plot_components)) %>% 
+  with(set_names(filename, sample)) %>%
+  pblapply(read_edgelist) %>% 
+  map(. %>% 
+        filter(component %in% plot_components)) 
+
+edgelists <-
+  edgelists %>% 
+  bind_rows(.id = "sample") %>% 
+  inner_join(plot_components %>% 
+               enframe("sample", "component"))
+
+# polarity_score %>% 
+#   mutate(marker = ifelse(marker == "Rituximab",
+#                          "CD20",
+#                          marker)) %>% 
+#   filter(marker %in% plot_markers) %>% 
+#   filter(paste(sample, component) %in% paste(names(plot_components), plot_components))
+# 
+# polarity_score %>% 
+#   filter(paste(sample, component, sep = "_") %in% CD3_gated_cells) %>% 
+#   filter(marker == "CD3E",
+#          experiment == "CD3") %>% 
+#   
+#   left_join(called_cells %>% arrange(-edges) %>% 
+#               filter(paste(sample, component, sep = "_") %in% CD3_gated_cells | experiment != "CD3") %>% 
+#               select(1:4)) %>% 
+#   filter(morans_z > 10,
+#          morans_i > 0.3) %>% 
+#   
+#   arrange(-edges) %>% 
+#   print(n = 30)
+# 
+# polarity_score %>% 
+#   filter(marker == "Rituximab",
+#          experiment == "Rituximab") %>% 
+#   filter(morans_z > 10,
+#          morans_i > 0.3) %>% 
+#   arrange(-morans_i)
+#   print(n = 30)
+  
+
+polarity_score %>% 
+  filter(paste(sample, component, sep = "_") %in% CD3_gated_cells | experiment != "CD3") %>% 
+  mutate(marker = ifelse(marker == "Rituximab",
+                         "CD20",
+                         marker)) %>% 
+  filter(marker %in% plot_markers) %>% 
+  ggplot(aes(morans_i, marker, fill = sample_type)) +
+  geom_vline(xintercept = 0, color = "gray") +
+  geom_violin(scale = "width",
+              draw_quantiles = 0.5) +
+  geom_point(data = . %>% 
+               filter(paste(sample, component) %in% paste(names(plot_components), plot_components))) +
+  facet_wrap(~experiment) +
+  theme_pg()
+  
+  
+
+plot_edgelist <- 
+  edgelists %>% 
+  inner_join(enframe(plot_components, "sample", "component")) %>% 
+  mutate(sample_component = paste(sample, component, sep = "_")) %>% 
+  mutate(marker = ifelse(marker == "Rituximab",
+                         "CD20",
+                         marker))
+  
+
+component_counts <- 
+  plot_edgelist %>% 
+  group_by(sample_component, upia, marker) %>% 
+  count() %>% 
+  ungroup() %>% 
+  spread(marker, n, fill = 0) %>% 
+  gather(marker, n, -1, -2) %>% 
+  group_by(sample_component, upia) %>% 
+  mutate(rel = n / sum(n),
+         clr = log(n + 1) - mean(log(n + 1)),
+         rel_clr = log(clr + 1) - mean(log(clr + 1))) %>% 
+  filter(!str_detect(marker, "^BC"))
+
+
+simple_graph <- 
+  plot_components %>% 
+  paste(names(.), ., sep = "_") %>% 
+  set_names(.,.) %>% 
+  lapply(function(comp) {
+    plot_edgelist %>% 
+      filter(sample_component == comp) %>% 
+      select(upia, upib) %>% 
+      distinct() %>% 
+      edgelist_to_simple_bipart_graph()
+  }) 
+
+graph_layout <- 
+  simple_graph %>% 
+  map(. %>% 
+        {
+          ingraph <- .;
+          layout_with_kk(ingraph, dim = 2) %>% 
+            as_tibble() %>% 
+            mutate(upia = as_tibble(ingraph)$name) 
+        }) %>% 
+  bind_rows(.id = "component") %>% 
+  left_join(component_counts)
+
+
+graph_layout <- 
+  graph_layout %>% 
+  left_join(simple_graph %>% 
+              map(. %>% 
+                    as_tibble()) %>% 
+              bind_rows(.id = "component"),
+            by = c("component", "upia" = "name")) 
+
+graph_layout %>% 
+  filter(node_type == "B")
+
+graph_layout %>% 
+  filter(node_type == "A") %>% 
+  select(component, V1, V2, upia) %>% 
+  distinct() %>% 
+  ggplot(aes(V1, V2)) +
+  geom_point() +
+  facet_wrap(~component) +
+  coord_fixed() +
+  theme_pg()
+
+
+plot <- 
+  graph_layout %>% 
+  arrange(n) %>% 
+  inner_join(plot_markers %>% 
+               enframe("i", "marker")) %>%
+  group_by(component, marker) %>% 
+  # mutate(color = scales::rescale(log10(n + 1), 0:1)) %>% 
+  mutate(color = scales::rescale(log10(n+1), 0:1)) %>% 
+  ggplot(aes(V1, V2, color = color)) +
+  # geom_density_2d() +
+  # stat_summary_2d(bins = 40) +
+  geom_point(size = 1) +
+  facet_grid(component ~ marker) +
+  scale_color_viridis(option = "inferno") +
+  # scale_color_gradient(low = "white", high = "orangered", limits = 0:1) +
+  coord_fixed() +
+  theme_void()
+
+
+
+######
+plot_data <- 
+  graph_layout %>% 
+  select(component, V1, V2, upia) %>% 
+  distinct() %>% 
+  group_by(component) %>% 
+  mutate(centroid_V1 = mean(V1),
+         centroid_V2 = mean(V2)) %>% 
+  ungroup() %>% 
+  mutate(centroid_dist = sqrt((V1 - centroid_V1)^2 + (V2 - centroid_V2)^2)) %>% 
+  group_by(component) %>% 
+  mutate(rank = rank(-centroid_dist),
+         part = rank/max(rank)) 
+
+plot_data %>% 
+  ggplot(aes(part, centroid_dist)) + 
+  geom_point() +
+  geom_vline(xintercept = 0.05,
+             linetype = "dashed")
+
+
+plot_data %>% 
+  arrange(-part) %>% 
+  
+  filter(part < 0.05)
+
+graph_layout_adjusted <- 
+  plot_data %>% 
+  group_by(component) %>% 
+  mutate(scale_factor = min(centroid_dist[which(part <0.05)])) %>% 
+  ungroup() %>% 
+  mutate(V1_adj = (V1 - centroid_V1) / scale_factor,
+         V2_adj = (V2 - centroid_V2) / scale_factor) 
+
+graph_layout_adjusted %>% 
+  ggplot(aes(V1_adj, V2_adj)) +
+  geom_point() +
+  # geom_circle(data = tibble(),
+  #             aes(x0 = 0, y0 = 0, r = 1),
+  #             inherit.aes = F,
+  #             color = "red") +
+  facet_wrap(~component) +
+  coord_fixed() +
+  theme_pg()
+
+
+plot_data <- 
+  graph_layout %>% 
+  left_join(graph_layout_adjusted %>% 
+              select(component, V1_adj, V2_adj, upia)) %>% 
+  arrange(n) %>% 
+  inner_join(plot_markers %>% 
+               enframe("i", "marker")) %>%
+  group_by(component, marker) %>% 
+  # mutate(color = scales::rescale(log10(n + 1), 0:1)) %>% 
+  mutate(color = scales::rescale(log10(n+1), 0:1)) 
+
+
+
+plot <- 
+  plot_data %>% 
+  mutate(component = str_remove(component, ".*CVCMP") %>% as.numeric) %>% 
+  ggplot(aes(V1_adj, V2_adj, color = color)) +
+  # geom_density_2d() +
+  # stat_summary_2d(bins = 40) +
+  ggrastr::geom_point_rast(size = 0.5) +
+  facet_grid(component ~ marker) +
+  scale_color_viridis(option = "inferno") +
+  # scale_color_gradient(low = "white", high = "orangered", limits = 0:1) +
+  coord_fixed() +
+  scale_x_continuous(limits = max(abs(plot_data$V1_adj)) * c(-1, 1),
+                     expand = expansion(0.015)) +
+  scale_y_continuous(limits = max(abs(plot_data$V2_adj)) * c(-1, 1),
+                     expand = expansion(0.015)) +
+  theme_void() +
+  theme(panel.spacing = unit(0, "mm"))
+plot
+ggsave("results/polarization/graph examples scaled size.png",
+       plot = plot,
+       width = 7, height = 5)
+ggsave("results/polarization/graph examples scaled size.pdf",
+       plot = plot,
+       width = 7, height = 5)
+
+
+ plot_data %>% 
+  mutate(component = str_remove(component, ".*CVCMP") %>% as.numeric) %>% 
+  ggplot(aes(V1_adj, V2_adj, z = color)) +
+  # geom_density_2d() +
+  stat_summary_2d(bins = 16) +
+  
+  facet_grid(component ~ marker) +
+  scale_fill_viridis(option = "inferno") +
+  # scale_color_gradient(low = "white", high = "orangered", limits = 0:1) +
+  coord_fixed() +
+  scale_x_continuous(limits = max(abs(plot_data$V1_adj)) * c(-1, 1),
+                     expand = expansion(0.015)) +
+  scale_y_continuous(limits = max(abs(plot_data$V2_adj)) * c(-1, 1),
+                     expand = expansion(0.015)) +
+  theme_void() +
+  theme(panel.spacing = unit(0, "mm"))
+```
+
+
+

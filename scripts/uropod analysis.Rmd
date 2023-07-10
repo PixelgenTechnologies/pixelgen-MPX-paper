@@ -1,0 +1,2331 @@
+---
+title: "Uropod analysis"
+author: "Max Jonatan Karlsson"
+date: "2023-05-08"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+### Set directory
+
+```{r}
+
+knitr::opts_knit$set(root.dir = "C:/Users/Max/Documents/Pixelgen/Projects/2023-technical-manuscript/")
+
+```
+
+
+### Load packages 
+
+```{r message=FALSE, warning=FALSE, include=TRUE}
+
+# Framework packages
+library(tidyverse)
+library(Seurat)
+
+# Visualization packages
+library(patchwork)
+library(viridis)
+library(ggforce)
+library(pheatmap)
+library(plotly)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(graphlayouts)
+library(ggplotify)
+
+# Statistics packages
+library(ggpubr)
+library(rstatix)
+library(broom)
+
+# Utility packages
+library(pbapply)
+
+source("scripts/utility.R")
+source("scripts/theme.R")
+
+```
+
+
+### Manage data
+
+First, we convert the .pxl AnnData files to Seurat format, so we can use the standard Seurat functions for data analysis.  
+
+#### Convert pxl Anndata files
+
+```{r}
+# The folders the data is located in:
+data_folders <- 
+  c("C:/Users/Max/data/pixelgen/PGseq98/0.12.0/analysis/")
+
+
+# Create data frame containing data file information
+data_files <-
+  data_folders %>% 
+  list.files(full.names = T,
+             recursive = T) %>% 
+  enframe("i", "filename") %>% 
+  filter(str_detect(filename, "dataset.pxl$"))  %>% 
+  mutate(dataset = str_extract(filename, "PGseq\\d{1,2}"),
+         full_id = str_remove(filename, ".*\\/") %>% 
+           str_remove("\\..*"),
+         sample =  str_extract(full_id, "_S\\d_") %>% 
+           str_remove_all("_"),
+         rds_file = paste0(filename, ".rds"))
+  
+# Save file meta data
+
+data_files %>% 
+  write_csv("results/uropod/data files.csv")
+
+# Convert each .pxl AnnData file to Seurat and save an .rds file 
+# that is easily loaded in R
+for(i in 1:nrow(data_files)) {
+  
+  filename = data_files$filename[i]
+  newfilename = data_files$rds_file[i]
+  message(paste("Converting:", filename))
+  
+  if(file.exists(newfilename)) {
+    message("Converted file already exists\n")
+    next
+  }
+  
+  convert_pixelgenh5_seuratrds(filename, newfilename)
+}
+```
+
+#### Define meta data
+
+Create a data frame containing meta data. 
+
+```{r}
+
+# Create a meta data table from the data file information
+meta_data <-
+  data_files %>% 
+  select(sample, dataset, full_id) %>% 
+  mutate(stimulation = case_when(str_detect(full_id, "MCP1") ~ "MCP1",
+                                 str_detect(full_id, "Rantes") ~ "Rantes", 
+                                 T ~ "Not stimulated"),
+         coated = case_when(str_detect(full_id, "coated") ~ "Immob",
+                            T ~ "In solution"),
+         full_condition = paste(coated, stimulation, sep = " - "))
+
+# Save meta data
+meta_data %>% 
+  write_csv("results/uropod/Uropod meta data.csv")
+
+
+```
+
+
+##### AnnData file
+
+The AnnData file is stored in the .dataset.pxl file, and we previously converted it to a Seurat object and saved it as .rds to make it easy to retrieve. 
+
+```{r message=FALSE, warning=FALSE}
+# AnnData
+pg_data <- 
+  data_files %>% 
+  select(sample, rds_file) %>% 
+  deframe() %>% 
+  lapply(readRDS)
+```
+
+We extract the component meta data and put it in a separate data frame for easy access. 
+
+```{r message=FALSE, warning=FALSE}
+# Metrics
+metrics_data <- 
+  pg_data %>% 
+  map(. %>% 
+        {.@meta.data} %>% 
+        as_tibble(rownames = "component")) %>% 
+  bind_rows(.id = "sample")
+```
+
+##### Edge list
+
+The edge list contains the whole Molecular Pixelation graph, where each row corresponds to a unique read, and an edge in the bipartite graph. It has been used for previous stages such as multiplet recovery, polarization, and colocalization score calculations. 
+
+```{r message=FALSE, warning=FALSE}
+# Edgelists
+edgelists <-
+  data_files %>%
+  with(set_names(filename, sample)) %>%
+  pblapply(read_edgelist)
+```
+
+##### Polarization and colocalization scores
+
+The polarization and colocalization score files are tables of statistics calculated to estimate the spatial properties of markers in each individual component. 
+The polarization score consists of Moran's I, which estimates the degree of non-random spatial distribution, where high score indicates more spatial structure. 
+The colocalization scores consist of Jaccard index, and Pearson correlation, both calculated between pairs of markers, and across local neighborhoods of adjacent A pixels in each component. High score indicates colocalization of the two markers, while low score indicates that they do not have a spatial relationship.
+
+```{r message=FALSE, warning=FALSE}
+# Polarization & colocalization scores
+loc_scores <-
+  data_files %>%
+  with(set_names(filename, sample)) %>%
+  pblapply(read_pixeldata_item, items = c("colocalization", "polarization"))
+
+```
+
+### Analysis settings
+
+```{r}
+
+uropod_markers <- 
+  c("CD43", "CD44", "CD2", "CD50", "CD54", "CD11a", "CD18", "CD102", "CD242", "CD162")
+
+uropod_markers_north <- 
+  c("CD43", "CD44", "CD50", "CD54", "CD102", "CD242", "CD162")
+
+uropod_markers[!uropod_markers %in% rownames(pg_data$S2@assays$RNA@counts)]
+
+# Define some of the most important qc metrics for evaluating components
+metrics_of_interest <- 
+  c("edges", "umi_per_upia", "mean_reads")
+
+# Define some filters for refining cell calling
+component_filters <- 
+  list(minimum_edges = 8000, 
+       minimum_edge_rank = 11)
+
+condition_plot_order <- 
+  c("In solution - Not stimulated",
+    "In solution - MCP1",
+    "In solution - Rantes",
+    "Immob - Not stimulated",
+    "Immob - MCP1",
+    "Immob - Rantes")
+```
+
+## Quality Control
+
+Here we perform a quality control of the called cells, i.e. the components that have been labeled as real cells. This entails a manual refinement of the cell calling based on measured cell size by number of edges (number of unique detected antibodies), as well as removal of technical outliers. 
+
+### Edge rank plot
+
+The edge rank plot is used to call cells in a previous cell calling step in Pixelator. Here, we inspect it again and apply additional filters to remove cells that deviate from the component size distribution.
+
+In this plot, the used cutoffs are marked as dashed lines, and components that are deviating more than two standard deviations from the mean (number of edges) are marked in gray. 
+
+```{r}
+plot_data <- 
+  metrics_data %>% 
+  group_by(sample) %>% 
+  mutate(rank = rank(-edges, ties.method = "random"), 
+         mean_edges = mean(log10(edges)),
+         sd_edges = sd(log10(edges)),
+         edges_deviation = (log10(edges) - mean_edges) / sd_edges) %>% 
+  left_join(meta_data,
+             by = "sample") %>% 
+  ungroup()
+
+plot_data %>% 
+  ggplot(aes(rank, edges, color = sample)) +
+  geom_point(size = 0.5) +
+  geom_hline(yintercept = component_filters$minimum_edges,
+             linetype = "dashed") +
+  geom_vline(xintercept = component_filters$minimum_edge_rank,
+             linetype = "dashed") +
+  scale_y_log10() +
+  scale_x_log10() +
+  labs(x = "Component rank (by number of edges)",
+       y = "Number of edges") +
+  theme_pg() 
+
+ggsave("results/uropod/edge rank plot.png",
+       width = 7, height = 5)
+```
+
+Here we make a table saving the information of which cells we want to keep for further analysis.
+
+```{r}
+called_cells <- 
+  plot_data %>% 
+  filter(edges >= component_filters$minimum_edges,
+         rank >= component_filters$minimum_edge_rank)
+
+cat(paste("Out of", nrow(plot_data), "cells,", nrow(called_cells), "were called."))
+
+```
+
+Here we plot the number of called cells per condition and replicate. The target of 500 cells is marked as a dashed line. 
+
+```{r}
+
+
+called_cells %>% 
+  group_by(sample) %>% 
+  count() %>% 
+  left_join(meta_data,
+            by = c("sample")) %>% 
+  ggplot(aes(sample, n)) +
+  geom_hline(yintercept = 500,
+             linetype = "dashed") +
+  geom_col(position = position_dodge()) +
+  geom_text(aes(label = n),
+            vjust = -0.5) +
+  scale_y_continuous(expand = expansion(c(0, 0.1))) +
+  theme_pg() +
+  theme(panel.border = element_blank()) +
+  labs(title = "Number of called cells")
+ggsave("results/uropod/nbr called cells.png",
+       width = 4, height = 3)
+
+
+```
+
+## Inspect component metrics
+
+### Metrics of interest
+
+```{r}
+
+metrics_data %>% 
+  inner_join(called_cells %>% 
+               select(sample, component),
+             by = c("sample", "component")) %>% 
+  select(1, 2, all_of(metrics_of_interest)) %>% 
+  gather(metric, value, -1, -2) %>% 
+  left_join(meta_data, 
+            by = "sample") %>% 
+  ggplot(aes(sample, value, fill = coated)) +
+  geom_violin(draw_quantiles = 0.5) + 
+  facet_grid(metric ~ full_condition + sample, scales = "free") +
+  scale_y_log10() +
+  theme_pg()
+ggsave("results/uropod/metrics of interest violin.png",
+       width = 10, height = 7)
+
+
+
+```
+
+### Pixel content vs Marker specificity
+
+Rarily, antibodies form aggregates, which manifest themselves as outliers in Molecular Pixelation data. These usually have either high complexity, consisting of many random antibodies, or low complexity, mainly constituting a single antibody. We detect these by using a metric Tau, which ranges from 0, indicating equal distribution of counts across all antibodies, to 1, indicating all counts distributed to a single antibody. Additionally, aggregates often have dense pixels with a lot of antibodies detected per each pixel, which can be measured using the umi_per_upia metric, which is stored in the component meta data.
+
+Here we have plotted umi_per_upia against Tau, and colored each component by Pixelator's classification of Tau (low, normal, or high). It looks like Pixelator has accurately picked out a few outliers that might be antibody aggregates or components that has low specificity, binding many more different types of antibodies than we would expect from a normal cell. We will remove these from the analysis as well.  
+
+```{r}
+metrics_data %>% 
+  inner_join(called_cells %>% 
+               select(sample, component),
+             by = c("sample", "component")) %>% 
+  left_join(meta_data,
+            by = c("sample")) %>% 
+  ggplot(aes(tau, umi_per_upia, color = tau_type)) +
+  geom_point() +
+  theme_pg() +
+  facet_grid(coated ~ stimulation) +
+  scale_y_log10() +
+  scale_color_manual(values = c("high" = "orangered2", "low" = "skyblue3", "normal" = "gray")) +
+  labs(x = "Marker specificity (Tau)",
+       y = "Pixel content (UMI/UPIA)")
+ggsave("results/uropod/tau vs pixel content.png",
+       width = 10, height = 7)
+
+
+```
+Here we save a data frame with the cells that are deemed normal. 
+
+```{r}
+
+cleaned_cells <-
+  called_cells %>% 
+  filter(tau_type == "normal")
+
+cat(paste("Out of", nrow(called_cells), "cells,", nrow(cleaned_cells), "were kept"))
+```
+
+## Clean data
+
+### Filter data
+
+### Select features
+
+Some markers are unused barcodes (named e.g. BC11 in the data). Let's select only markers we are using in the assay.
+
+```{r}
+
+marker_types <-
+  pg_data$S1@assays$RNA %>% 
+  rownames() %>% 
+  enframe("i", "marker") %>% 
+  mutate(marker_type = case_when(str_detect(marker, "^BC\\d") ~ "Empty BC",
+                                 str_detect(marker, "^mIgG") ~ "Isotype ctrl",
+                                 T ~ "Normal")) 
+
+selected_features <-
+  marker_types %>% 
+  filter(marker_type != "Empty BC") %>% 
+  pull(marker) 
+
+selected_features %>% 
+  sort() %>% 
+  paste(collapse = ", ") %>% 
+  cat()
+
+
+pca_features <- 
+  marker_types %>% 
+  filter(marker_type == "Normal") %>% 
+  filter(!marker %in% c("TCRb", "CD41", "CD9", "CD36", "CD29", "ACTB", "CD62P")) %>% 
+  pull(marker)
+
+```
+
+
+### Remove cells and empty barcodes
+
+Here we filter the data to only keep the cells we have selected, and the markers that we selected in the previous step. 
+
+```{r}
+
+
+
+keep_cells <- 
+  cleaned_cells %>% 
+  mutate(cell_id = paste(sample, component, sep = "_"))
+
+# Merge Seurat objects 
+pg_data_comb <- 
+  merge(pg_data[[1]],
+        y = pg_data[-1],
+        add.cell.ids = names(pg_data)) 
+
+
+# Keep only cells and features we have selected previously
+pg_data_comb[["cell_id"]] <- colnames(pg_data_comb)
+
+pg_data_comb <- 
+  pg_data_comb %>% 
+  subset(subset = cell_id %in% keep_cells$cell_id) %>% 
+  subset(features = selected_features)
+
+# Add some meta data directly to the Seurat object. We will need this later.
+# Sample ID (e.g. S3)
+pg_data_comb[["sample"]] <- str_remove(colnames(pg_data_comb), "_RCVCMP.*")
+
+# Stimulation
+pg_data_comb[["stimulation"]] <- meta_data$stimulation[match(pg_data_comb$sample, meta_data$sample)]
+
+# Coating
+pg_data_comb[["coated"]] <- meta_data$coated[match(pg_data_comb$sample, meta_data$sample)]
+
+
+
+```
+
+
+# Analysis (all cells)
+
+## Select features
+
+```{r}
+selected_markers <- 
+  pg_data_comb@assays$RNA@counts %>% 
+  log1p() %>% 
+  apply(MARGIN = 1, mean) %>% 
+  exp() %>% 
+  `-`(1) %>% 
+  sort() %>% 
+  enframe() %>% 
+  mutate(selected = !(str_detect(name, "^mIg") | name == "TCRb"))
+
+```
+
+
+## Remove platelets and dead cells
+
+```{r}
+temp_data <- 
+  pg_data_comb %>% 
+  # CLR transform data: 
+  NormalizeData(normalization.method = "LogNormalize")# %>%
+
+VlnPlot(temp_data, features = "CD45") +
+  geom_hline(yintercept = 6.5,
+             linetype = "dashed")
+
+VlnPlot(temp_data, features = c("CD3E")) +
+  geom_hline(yintercept = 4,
+             linetype = "dashed")
+
+VlnPlot(temp_data, features = "ACTB") +
+  geom_hline(yintercept = 2.5,
+             linetype = "dashed")
+
+VlnPlot(temp_data, features = c("mIgG1")) +
+  geom_hline(yintercept = 2.5,
+             linetype = "dashed")
+
+VlnPlot(temp_data, features = c("mIgG2a")) +
+  geom_hline(yintercept = 2.5,
+             linetype = "dashed")
+
+VlnPlot(temp_data, features = c("mIgG2b")) +
+  geom_hline(yintercept = 2.5,
+             linetype = "dashed")
+
+
+temp_data@assays$RNA@data[c("mIgG1",
+                            "mIgG2a",
+                            "mIgG2b", 
+                            "ACTB"),] %>% 
+  as.matrix() %>% 
+  t() %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  mutate(tau = temp_data$tau[sample_component]) %>% 
+  plot_ly(x = ~ACTB,
+          y = ~mIgG2a,
+          z = ~mIgG2b,
+          color = ~tau)
+```
+
+
+## Data processing
+
+```{r}
+
+
+pg_data_comb_processed <- 
+  pg_data_comb %>% 
+  
+   # log transform data: 
+  NormalizeData(normalization.method = "LogNormalize") %>%
+  # Remove platelets
+  subset(subset = CD45 > 6.5) %>% 
+  subset(subset = CD3E > 4) %>%
+  # Remove possibly dead cells
+  subset(subset = ACTB < 2.5) %>%
+  subset(subset = mIgG1 < 2.5) %>%
+  subset(subset = mIgG2a < 2.5) %>%
+  subset(subset = mIgG2b < 2.5) %>%
+  
+  subset(features = selected_markers$name[which(selected_markers$selected)]) %>% 
+  NormalizeData(normalization.method = "CLR", 
+                margin = 2) %>%
+  # Find variable features
+  FindVariableFeatures(nfeatures = 40, ) %>% 
+  
+  # Scale data 
+  ScaleData(scale.max = Inf, 
+            do.scale = T, 
+            do.center = T, 
+            verbose = F) %>% 
+  RunPCA(npcs = 30, features = pca_features) %>% 
+  RunUMAP(umap.method = "uwot",
+          min.dist = 0.1,
+          spread = 2,
+          n.neighbors = 25,
+          dims = 1:12)
+
+
+VariableFeaturePlot(pg_data_comb_processed, selection.method = "vst") +
+  geom_text(data = . %>% 
+              as_tibble(rownames = "marker"),
+            aes(label = marker, color = colors),
+            size = 2,
+            vjust = -0.5) +
+   theme(plot.background = element_rect(fill = "white", color = NA))
+ggsave("results/uropod/variable variance plot.png",
+       width = 7, height = 4)
+pg_data_comb_processed@reductions$pca@stdev
+
+umap_data <- 
+  pg_data_comb_processed@reductions$umap@cell.embeddings %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  separate(sample_component, into = c("sample", "component"), remove = F) %>% 
+  left_join(meta_data) %>% 
+  left_join(metrics_data)
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = sample)) +
+  geom_point(size = 0.1) + 
+  coord_fixed() +
+  theme_umap()
+ggsave("results/uropod/UMAP sample.png",
+       width = 4, height = 3)
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = coated)) +
+  geom_point(size = 0.1) + 
+  coord_fixed() +
+  theme_umap()
+ggsave("results/uropod/UMAP coated.png",
+       width = 4, height = 3)
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = stimulation)) +
+  geom_point(size = 0.1) + 
+  coord_fixed() +
+  theme_umap()
+ggsave("results/uropod/UMAP stimulation.png",
+       width = 4, height = 3)
+
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2)) +
+  geom_point(data = . %>% 
+               select(-full_condition),
+             color = "gray", 
+             size = 0.5) + 
+  geom_point(size = 0.1,
+             color = "orangered") + 
+  coord_fixed() +
+  facet_grid( ~ full_condition) +
+  theme_umap()
+ggsave("results/uropod/UMAP sample separated.png",
+       width = 8, height = 5)
+
+
+```
+
+
+## Clustering
+
+```{r}
+pg_data_comb_processed <- 
+  pg_data_comb_processed %>% 
+  FindNeighbors(dims = 1:12, k.param = 25, prune.SNN = 1/15,
+                n.trees = 100) %>% 
+  FindClusters(resolution = 1, 
+               method = "igraph",
+               n.start = 40,
+               algorithm = 2, 
+               random.seed = 42)
+
+umap_data <- 
+  pg_data_comb_processed@reductions$umap@cell.embeddings %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  separate(sample_component, into = c("sample", "component"), remove = F) %>% 
+  left_join(meta_data) %>% 
+  left_join(pg_data_comb_processed@meta.data %>% 
+              as_tibble(rownames = "sample_component"))
+
+
+umap_data %>% 
+  group_by(seurat_clusters) %>% 
+  count() %>% 
+  ggplot(aes(n, seurat_clusters)) +
+  geom_col() +
+  geom_text(aes(label = n), 
+            hjust = 0) +
+  theme_pg()
+  
+
+umap_data %>% 
+  group_by(stimulation, coated, seurat_clusters) %>% 
+  count() %>% 
+  ggplot(aes(n, seurat_clusters)) +
+  geom_col() +
+  geom_text(aes(label = n), 
+            hjust = 0) +
+  facet_grid(coated ~ stimulation) +
+  theme_pg()
+
+
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2)) +
+  geom_point(aes(color = seurat_clusters),
+             size = 1,
+             show.legend = F) + 
+  geom_point(data = . %>% 
+               group_by(seurat_clusters) %>% 
+               summarise(UMAP_1 = median(UMAP_1),
+                         UMAP_2 = median(UMAP_2)),
+             size = 5,
+             alpha = 0.5) +
+  geom_text(data = . %>% 
+               group_by(seurat_clusters) %>% 
+               summarise(UMAP_1 = median(UMAP_1),
+                         UMAP_2 = median(UMAP_2)),
+             size = 3,
+            aes(label = seurat_clusters), 
+            color = "white") +
+  coord_fixed() +
+  theme_umap()
+ggsave("results/uropod/cluster umap.png",
+       width = 5, height = 5)
+
+
+```
+
+
+### Find cluster identities
+
+#### Differential Abundance analysis
+
+```{r}
+DE_cluster <- 
+  pg_data_comb_processed %>% 
+  SetIdent(value = "seurat_clusters") %>% 
+  FindAllMarkers(slot = "data", # Use the normalized data slot
+                 min.pct = 0, 
+                 test.use = "wilcox", 
+                 logfc.threshold = 0, 
+                 return.thresh = Inf,
+                 max.cells.per.ident = 100) %>% 
+  as_tibble() 
+
+DE_cluster %>% 
+  ggplot(aes(avg_log2FC, -log10(p_val_adj),
+             color = p_val_adj < 0.01)) +
+  geom_point() +
+  theme_pg()
+
+```
+
+
+```{r, fig.width = 4, fig.height = 4}
+plot_data <-
+  DE_cluster %>% 
+  group_by(gene) %>% 
+  filter(any(p_val_adj < 0.01 & 
+           abs(avg_log2FC) > 0.5)) %>% 
+  select(avg_log2FC, cluster, gene) %>% 
+  spread(cluster, avg_log2FC) %>% 
+  column_to_rownames("gene")
+
+
+rg <- max(abs(plot_data))
+
+           
+DE_cluster_heatmap <- 
+  plot_data %>% 
+  pheatmap(breaks = seq(-rg, rg, length.out = 100),
+           color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 11, 
+                                                                 name = "RdBu")))(100), 
+           cellwidth = 10, 
+           cellheight = 10)
+  
+ggsave("results/uropod/cluster DE avg_diff heatmap.png",
+       plot = as.ggplot(DE_cluster_heatmap) +
+         theme(plot.background = element_rect(fill = "white", color = NA)),
+       width = 5, height = 10)
+```
+
+```{r}
+
+
+FeaturePlot(pg_data_comb_processed,
+            coord.fixed = T,
+            features = c("CD4",
+                         "CD3E",
+                         "CD8")) 
+
+FeaturePlot(pg_data_comb_processed, 
+            coord.fixed = T,
+            features = c("B2M",
+                         "CD45",
+                         "HLA-ABC",
+                         "tau"))
+
+FeaturePlot(pg_data_comb_processed, 
+            coord.fixed = T,
+            features = c("CD18",
+                         "CD16",
+                         "CD14",
+                         "CD11a"))
+
+FeaturePlot(pg_data_comb_processed, 
+            coord.fixed = T,
+            features = uropod_markers)
+
+```
+
+
+
+```{r, fig.width = 4, fig.height = 4}
+# paste0("'", with(DE_cluster_heatmap$tree_col, labels[order]),
+#        "' = ''", collapse = ",\n") %>%
+#   cat()
+
+cell_annotation <- 
+  c('0' = 'CD8 T cells',
+    '3' = 'CD8 T cells',
+    '5' = 'Unknown',
+    '2' = 'CD4 T cells',
+    '1' = 'Unknown',
+    '4' = 'CD8 T cells') %>% 
+  enframe("cluster", "cell_type")
+
+
+plot_data <-
+  DE_cluster %>% 
+  group_by(gene) %>% 
+  filter(any(p_val_adj < 0.01 & 
+           abs(avg_log2FC) > 0.5)) %>% 
+  left_join(cell_annotation) %>% 
+  unite(id, cluster, cell_type) %>% 
+  select(avg_log2FC, id, gene) %>% 
+  spread(id, avg_log2FC) %>% 
+  column_to_rownames("gene")
+
+
+rg <- max(abs(plot_data))
+
+           
+DE_cluster_heatmap_annotated <- 
+  plot_data %>% 
+  pheatmap(breaks = seq(-rg, rg, length.out = 100),
+           color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 11, 
+                                                                 name = "RdBu")))(100), 
+           cellwidth = 10, 
+           cellheight = 10)
+
+
+ggsave("results/uropod/cluster DE avg_diff heatmap annotated.png",
+       plot = as.ggplot(DE_cluster_heatmap_annotated),
+       width = 5, height = 7)
+
+```
+
+#### Define identities
+
+```{r}
+
+component_identities <- 
+  pg_data_comb_processed@meta.data %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  select(sample_component, cluster = seurat_clusters) %>% 
+  left_join(cell_annotation,
+            by = "cluster") %>% 
+  separate(sample_component, into = c("sample", "component"), remove = F)
+
+component_identities %>% 
+  group_by(sample, cluster, cell_type) %>% 
+  count() %>% 
+  left_join(meta_data) %>% 
+  ggplot(aes(sample, n, fill = cell_type)) +
+  geom_col() +
+  facet_grid(~ coated + stimulation, 
+             scale = "free_x") +
+  theme_pg()
+
+component_identities %>% 
+  group_by(sample, cell_type) %>% 
+  count() %>% 
+  group_by(sample) %>% 
+  mutate(n = n/ sum(n)) %>% 
+  ungroup() %>% 
+  left_join(meta_data) %>% 
+  select(-sample, -full_id, - full_condition) %>% 
+  spread(coated, n, fill = 0) %>% 
+  ggplot(aes(Immob, `In solution`, color = cell_type)) +
+  geom_abline(show.legend = F, 
+              color = "gray") +
+  geom_mark_ellipse(aes(label = cell_type),label.fontsize = 7,expand = 0.01,
+                    show.legend = F) + 
+  geom_point(show.legend = F) +
+  theme_pg() +
+  coord_fixed() +
+  scale_x_continuous(limits = c(0, 0.8)) +
+  scale_y_continuous(limits = c(0, 0.8)) +
+  labs(title = "Cell type frequency compared",
+       subtitle = "In solution vs CD54 Immob samples")
+  
+ggsave("results/uropod/cell frequency compared solution vs coated.png",
+       width= 7, height = 7)
+
+component_identities %>% 
+  left_join(meta_data,
+            by = c("sample")) %>% 
+  write_csv("results/uropod/cell annotations.csv")
+```
+
+
+#### Visualize Differentially abundant markers
+
+```{r, fig.width = 6, fig.height = 6}
+
+plot_markers <- 
+  DE_cluster %>% 
+  filter(abs(avg_log2FC) > 0.5,
+         p_val < 0.01) %>% 
+  pull(gene) %>% 
+  unique()
+
+plot_data <- 
+  umap_data %>% 
+   left_join(pg_data_comb_processed@assays$RNA@data %>% 
+              as_tibble(rownames = "marker") %>% 
+              gather(sample_component, norm_data, -1)) %>% 
+  filter(marker %in% c(plot_markers)) %>% 
+  group_by(marker) %>% 
+  mutate(norm_data_rel = norm_data / max(norm_data)) 
+
+plot_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = norm_data_rel)) +
+  geom_point(size = 0.1) + 
+  facet_wrap(~marker) +
+  scale_color_viridis() +
+  coord_fixed() +
+  theme_umap()
+ggsave("results/uropod/UMAP some markers norm_data_rel.png",
+       width = 12, height = 10)
+
+
+```
+
+
+## Define markers to include in abundance test
+
+```{r}
+
+features_for_abtest <- 
+  pg_data_comb@assays$RNA@counts %>% 
+  rowSums %>% enframe() %>% 
+  arrange(value) %>% 
+  filter(value > max(value[which(str_detect(name, "^mIg") | name == "ACTB")])) %>% 
+  filter(name != "TCRb") %>% # Remove TCRb since it is not in the data
+  pull(name) 
+
+```
+
+
+## Differential Abundance analysis (condition)
+
+```{r}
+
+
+temp_test_data <- 
+  pg_data_comb_processed %>% 
+  
+  AddMetaData(metadata = paste(.@meta.data$coated, .@meta.data$stimulation, sep = " - "), col.name = 'full_condition') %>%
+  AddMetaData(metadata = component_identities$cell_type[match(names(.@active.ident), component_identities$sample_component)], col.name = 'cell_type') %>% 
+  SetIdent(value = "full_condition") 
+
+DE_condition <- 
+  
+  
+  tibble(ident = unique(temp_test_data$full_condition)) %>% 
+  filter(ident != "In solution - Not stimulated") %>% 
+  group_by(ident) %>% 
+  do({
+    FindMarkers(temp_test_data,
+                slot = "data", # Use the normalized data slot
+                min.pct = 0, 
+                features = features_for_abtest,
+                ident.1 = .$ident,
+                ident.2 = "In solution - Not stimulated",
+                test.use = "wilcox", 
+                logfc.threshold = 0, 
+                return.thresh = Inf,
+                max.cells.per.ident = 50) %>% 
+      as_tibble(rownames = "marker") 
+    
+  }) %>% 
+  ungroup()
+
+DE_condition %>% 
+  ggplot(aes(avg_log2FC, -log10(p_val_adj))) +
+  geom_point() +
+  geom_hline(yintercept = -log10(0.01),
+             linetype = "dashed") +
+  geom_vline(xintercept = 1 * c(-1, 1),
+             linetype = "dashed") +
+  theme_pg()
+
+
+DE_condition %>% 
+  group_by(marker) %>% 
+  filter(any(p_val_adj < 0.05 &
+               abs(avg_log2FC) > 0.3)) %>% 
+  ungroup() %>% 
+  add_significance(p.col = "p_val_adj") %>% 
+  select(marker, ident, avg_log2FC, p_val_adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(ident = factor(ident, condition_plot_order)) %>% 
+  ggplot(aes(marker, ident, fill = avg_log2FC)) +
+  geom_tile() +
+  geom_text(data = . %>% 
+              filter(p_val_adj.signif != "ns"),
+            aes(label = p_val_adj.signif),
+            size = 2) +
+  coord_fixed() + 
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       limits = 1.2 * c(-1, 1)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(y = "Condition",
+       title = "Differentially abundant markers",
+       subtitle = "Compared to uncoated - unstimulated")
+
+
+write_csv(DE_condition, "results/uropod/ab wilcox test.csv")
+
+```
+
+
+### Some examples of diff pol
+
+```{r}
+
+temp_test_data@assays$RNA@data %>%
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, clr, -1) %>% 
+  filter(marker %in% c("CD50")) %>% 
+  separate(sample_component, into = c("sample", "component")) %>% 
+  left_join(meta_data) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  ggplot(aes(full_condition, clr)) +
+  geom_hline(yintercept = 0, 
+             color = "gray") +
+  geom_violin(draw_quantiles = 0.5, 
+              fill = "gray90") +
+  geom_jitter(size = 0.1, 
+              alpha = 0.5) +
+  stat_compare_means(ref.group = "In solution - Not stimulated", label = "p.signif") +
+  theme_pg() +
+  facet_wrap(~marker, nrow = 3) +
+  scale_y_continuous(expand = expansion(c(0.05, 0.15))) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 60))
+ggsave("results/uropod/diff ab i uropod markers full cond CD50.pdf",
+       width = 3, height = 4)
+
+
+```
+
+
+## Differential polarization
+
+```{r}
+polarization_scores <- 
+  loc_scores %>% 
+  map(. %>% 
+        {.$polarization}) %>% 
+  bind_rows(.id = "sample") %>% 
+  janitor::clean_names() %>%
+  filter(!str_detect(marker, "^BC\\d")) %>% 
+  left_join(meta_data) %>% 
+  left_join(component_identities) %>% 
+  filter(complete.cases(.)) %>% 
+  left_join(pg_data_comb@assays$RNA@counts %>% 
+              as_tibble(rownames = "marker") %>% 
+              gather(sample_component, count, -1)) %>% 
+  filter(sample_component %in% names(pg_data_comb_processed@active.ident))
+
+
+
+#######################################################################
+temp_test_data <- 
+  polarization_scores %>% 
+  filter(marker %in% features_for_abtest)
+
+temp_test_data %>%  
+  select(cell_type, full_condition, sample, component) %>% 
+  distinct() %>% 
+  group_by(cell_type, full_condition) %>% 
+  count() 
+
+if(file.exists("results/uropod/diff polar wilcox res.csv")) {
+  polarization_wilcox_res <- read_csv("results/uropod/diff polar wilcox res.csv")
+} else {
+  set.seed(1)
+  polarization_wilcox_res <-
+    temp_test_data %>% 
+    group_by(sample, marker) %>% 
+    slice(sample(1:length(component), min(length(component), 100))) %>% 
+    ungroup() %>% 
+    nest_by(marker) %>% 
+    summarise(wilcox_res = list(wilcox_test(data = data,
+                                            morans_i  ~ full_condition, 
+                                            ref.group = "In solution - Not stimulated",
+                                            detailed = T) %>% 
+                                  add_xy_position(step.increase = 0.2))) %>% 
+    unnest(wilcox_res) %>% 
+    ungroup() %>% 
+    mutate(p.adj = p.adjust(p, method = "BH")) %>% 
+    ungroup() %>% 
+    add_significance(p.col = "p.adj") %>% 
+    mutate(estimate = -estimate)
+  write_csv(polarization_wilcox_res, file = "results/uropod/diff polar wilcox res.csv")
+}
+
+
+if(file.exists("results/uropod/diff polar wilcox res z.csv")) {
+  polarization_wilcox_res <- read_csv("results/uropod/diff polar wilcox res z.csv")
+} else {
+  set.seed(1)
+  polarization_wilcox_res_z <-
+    temp_test_data %>% 
+    group_by(sample, marker) %>% 
+    slice(sample(1:length(component), min(length(component), 100))) %>% 
+    ungroup() %>% 
+    nest_by(marker) %>% 
+    summarise(wilcox_res = list(wilcox_test(data = data,
+                                            morans_z  ~ full_condition, 
+                                            ref.group = "In solution - Not stimulated",
+                                            detailed = T) %>% 
+                                  add_xy_position(step.increase = 0.2))) %>% 
+    unnest(wilcox_res) %>% 
+    ungroup() %>% 
+    mutate(p.adj = p.adjust(p, method = "BH")) %>% 
+    ungroup() %>% 
+    add_significance(p.col = "p.adj") %>% 
+    mutate(estimate = -estimate)
+  
+  write_csv(polarization_wilcox_res_z, file = "results/uropod/diff polar wilcox res z.csv")
+}
+
+
+
+polarization_wilcox_res %>% 
+  arrange(p.adj) %>% 
+  filter(p.adj < 0.05) %>% 
+  print(n = 100)
+
+
+polarization_wilcox_res %>% 
+  group_by(marker) %>% 
+  filter(any(p.adj < 0.05 &
+               abs(estimate) > 0.01)) %>% 
+  select(marker, group2, estimate, p.adj, p.adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(group2 = factor(group2, condition_plot_order)) %>% 
+  ggplot(aes(marker, group2, fill = estimate)) +
+  geom_tile() +
+  geom_text(data = . %>% 
+              filter(p.adj.signif != "ns"),
+            aes(label = p.adj.signif),
+            size = 2) +
+  coord_fixed() + 
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       limits = 0.05 * c(-1, 1)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(y = "Condition",
+       title = "Differentially polarized markers",
+       subtitle = "Compared to uncoated - unstimulated")
+ggsave("results/uropod/Differentially polarized markers.png",
+       width = 9, height = 6)
+
+
+```
+
+### Compare Moran's I vs Z
+
+```{r}
+
+
+plot_data <- 
+  
+  list(i = polarization_wilcox_res,
+       z = polarization_wilcox_res_z) %>% 
+  map(. %>% 
+        select(1:2, group2)) %>% 
+  bind_rows(.id = "type") %>% 
+  spread(type, estimate) 
+
+plot_cor <- 
+  plot_data %>% 
+  group_by(group2) %>% 
+  summarise(cor = cor(i,
+                      z,
+                      method = "pearson")) %>% 
+  mutate(cor_label = paste("Pearson's r:", round(cor, 3)))
+
+plot_data %>% 
+  left_join(plot_cor) %>% 
+  ggplot(aes(i, z)) +
+  geom_vline(xintercept = 0, color = "gray80") +
+  geom_hline(yintercept = 0, color = "gray80") +
+  geom_smooth(method = "lm",
+              linewidth = 0.5) +
+  geom_point(size = 0.5)+
+  facet_wrap(~group2 + cor_label) +
+  labs(x = "Avg. Difference (Moran's I)",
+       y = "Avg. Difference (Moran's Z)") +
+  theme_pg()
+
+ggsave("results/uropod/Morans I vs Z wilcox res.png",
+       width = 5, height = 5)
+ggsave("results/uropod/Morans I vs Z wilcox res.pdf",
+       width = 5, height = 5)
+
+```
+
+
+### Some examples of diff pol
+
+```{r}
+
+polarization_scores %>% 
+  filter(marker %in% c("CD50")) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  ggplot(aes(full_condition, morans_i)) +
+  geom_hline(yintercept = 0, 
+             color = "gray") +
+  geom_violin(draw_quantiles = 0.5, 
+              fill = "gray90") +
+  geom_jitter(size = 0.1, 
+              alpha = 0.5) +
+  stat_compare_means(ref.group = "In solution - Not stimulated", label = "p.signif") +
+  theme_pg() +
+  facet_wrap(~marker, nrow = 3) +
+  scale_y_continuous(expand = expansion(c(0.05, 0.15))) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 60))
+ggsave("results/uropod/diff pol i uropod markers full cond CD50.pdf",
+       width = 3, height = 4)
+
+
+```
+
+
+## Colocalization permutation testing
+
+### Load colocalization results
+
+```{r}
+colocalization_scores <- 
+  loc_scores %>% 
+  map(. %>% 
+        {.$colocalization}) %>% 
+  bind_rows(.id = "sample") %>% 
+  filter(!is.na(pearson_z)) %>% 
+  unite(sample_component, sample, component, remove = F) %>% 
+  left_join(meta_data) %>% 
+  
+  left_join(pg_data_comb@assays$RNA@counts %>%
+              as_tibble(rownames = "marker_1") %>%
+              gather(sample_component, count, -1),
+            by = c("marker_1", "sample_component")) %>% 
+  
+  left_join(pg_data_comb@assays$RNA@counts %>%
+              as_tibble(rownames = "marker_2") %>%
+              gather(sample_component, count, -1),
+            by = c("marker_2", "sample_component"),
+            suffix = c("1", "2")) %>% 
+  mutate(min_count = ifelse(count1 < count2,
+                            count1, count2)) %>% 
+  # Deselect some columns to reduce memory usage_
+  select(-dataset, -full_id) 
+
+
+colocalization_scores %>% 
+  filter(marker_1 %in% uropod_markers,
+         marker_2 %in% uropod_markers) %>% 
+  gather(score_type, score, pearson, pearson_z) %>% 
+  ggplot(aes(min_count, score)) +
+  geom_point(alpha = 0.1) +
+  geom_text(data = . %>% 
+              group_by(score_type) %>% 
+              summarise(cor = cor(min_count, score, method = "spearman")),
+            aes(x = 1, y = 1, label = round(cor, 2)),
+            hjust = 0, vjust = 0) +
+  facet_wrap(~score_type, scales = "free_y") +
+  theme_pg() +
+  scale_x_log10() +
+  labs(x = "Minimum count (marker1 vs marker2)",
+       y = "Colocalization score",
+       title = "Colocalization score dependence to count of uropod markers",
+       subtitle = "Each point is a marker pair in a component")
+ggsave("results/uropod/colocalization vs minimum counts uropod z score.png",
+       width = 8, height = 6)
+
+colocalization_scores %>% 
+  # slice(sample(1:nrow(.), 10000)) %>% 
+  gather(score_type, score, pearson, pearson_z) %>% 
+  
+  ggplot(aes(min_count, score)) +
+  geom_bin_2d(aes(fill = log10(after_stat(count)))) +
+  geom_text(data = . %>% 
+              group_by(score_type) %>% 
+              summarise(cor = cor(min_count, score, method = "spearman", use = "pairwise.complete.obs")),
+            aes(x = 1, y = 1, label = round(cor, 2)),
+            hjust = 0, vjust = 0) +
+  scale_fill_gradient(low = "white", high = "orangered") +
+  facet_wrap(~score_type, scales = "free_y") +
+  theme_pg() +
+  scale_x_log10() +
+  labs(x = "Minimum count (marker1 vs marker2)",
+       y = "Colocalization score",
+       title = "Colocalization score dependence",
+       subtitle = "Each point is a marker pair in a component")
+ggsave("results/uropod/colocalization vs minimum counts all markers.png",
+       width = 8, height = 6)
+
+
+colocalization_scores %>% 
+  filter(marker_1 %in% features_for_abtest) %>% 
+  filter(marker_2 %in% features_for_abtest) %>% 
+  filter(min_count >= 5) %>% 
+  gather(score_type, score, pearson, pearson_z) %>% 
+  
+  ggplot(aes(min_count, score)) +
+  geom_bin_2d(aes(fill = log10(after_stat(count)))) +
+  geom_text(data = . %>% 
+              group_by(score_type) %>% 
+              summarise(cor = cor(min_count, score, method = "spearman", use = "pairwise.complete.obs")),
+            aes(x = 1, y = 1, label = round(cor, 2)),
+            hjust = 0, vjust = 0) +
+  scale_fill_gradient(low = "white", high = "orangered") +
+  facet_wrap(~score_type, scales = "free_y") +
+  theme_pg() +
+  scale_x_log10() +
+  labs(x = "Minimum count (marker1 vs marker2)",
+       y = "Colocalization score",
+       title = "Colocalization score dependence",
+       subtitle = "Each point is a marker pair in a component")
+ggsave("results/uropod/colocalization vs minimum counts test markers.png",
+       width = 8, height = 6)
+```
+
+### Run DL test
+
+```{r}
+
+temp_test_data <- 
+  colocalization_scores %>% 
+  filter(!str_detect(marker_1, "^BC"),
+         !str_detect(marker_2, "^BC")) %>% 
+  filter(marker_1 %in% features_for_abtest) %>% 
+  filter(marker_2 %in% features_for_abtest) %>% 
+  filter(min_count >= 5) %>% 
+  mutate(pearson_diff = pearson - pearson_mean) %>% 
+  filter(sample_component %in% names(pg_data_comb_processed@active.ident))
+
+# Filter out that at least 10 cells have at least 5 counts detected per marker and condition:  
+tests_todo <- 
+  temp_test_data %>%  
+  select(marker_1, marker_2, full_condition, sample, component) %>% 
+  distinct() %>% 
+  group_by(marker_1, marker_2, full_condition) %>% 
+  count() %>% 
+  ungroup() %>% 
+  filter(n >= 10) %>% 
+  spread(full_condition, n) %>% 
+  gather(full_condition, n, -marker_1, -marker_2, -`In solution - Not stimulated`) %>% 
+  filter(!is.na(n)) %>% 
+  filter(!is.na(`In solution - Not stimulated`)) %>% 
+  filter(n >= 10,
+         `In solution - Not stimulated` >= 10) %>% 
+  spread(full_condition, n) %>% 
+  gather(full_condition, n, -1, -2) %>% 
+  filter(complete.cases(.)) %>% 
+  select(marker_1, marker_2, full_condition) %>% 
+  distinct()
+
+if(file.exists("results/uropod/diff coloc wilcox res.csv")) {
+  coloc_wilcox_res <- read_csv("results/uropod/diff coloc wilcox res.csv")
+} else {
+  set.seed(42)
+  coloc_wilcox_res <-
+    temp_test_data %>% 
+    inner_join(tests_todo) %>% 
+    group_by(sample, marker_1, marker_2) %>% 
+    slice(sample(1:length(component), min(length(component), 100))) %>% 
+    ungroup() %>% 
+    nest_by(marker_1, marker_2) %>% 
+    summarise(wilcox_res = list(wilcox_test(data = data,
+                                            pearson_z  ~ full_condition, 
+                                            ref.group = "In solution - Not stimulated",
+                                            detailed = T) %>% 
+                                  add_xy_position(step.increase = 0.2))) %>% 
+    unnest(wilcox_res) %>% 
+    ungroup() %>% 
+    mutate(p.adj = p.adjust(p, method = "BH")) %>% 
+    ungroup() %>% 
+    add_significance(p.col = "p.adj") %>% 
+    mutate(estimate = -estimate)
+  
+  write_csv(coloc_wilcox_res, file = "results/uropod/diff coloc wilcox res.csv")
+}
+
+
+  
+coloc_wilcox_res %>% 
+  group_by(marker_1, marker_2) %>% 
+  filter(any(p.adj < 0.05 &
+               abs(estimate) > 5)) %>% 
+  ungroup() %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  select(contrast, group2, estimate, p.adj, p.adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(group2 = factor(group2, condition_plot_order)) %>% 
+  ggplot(aes(contrast, group2, fill = estimate)) +
+  geom_tile() +
+  geom_text(data = . %>% 
+              filter(p.adj.signif != "ns"),
+            aes(label = p.adj.signif),
+            size = 2) +
+  coord_fixed() +
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       limits = 16 * c(-1, 1)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(y = "Condition",
+       title = "Differentially colocalized markers",
+       subtitle = "Compared to uncoated - unstimulated")
+ggsave("results/uropod/Differentially colocalized markers.png",
+       width = 9, height = 6)
+
+
+
+net_data <- 
+  coloc_wilcox_res %>% 
+  group_by(marker_1, marker_2) %>% 
+  filter(any(p.adj < 0.05 &
+               abs(estimate) > 5)) %>% 
+  select(marker_1, marker_2, estimate, group2, p.adj.signif) %>% 
+  mutate(group2 = factor(group2, condition_plot_order),
+         order = paste(unclass(group2), group2),
+         edge_label = ifelse(p.adj.signif == "ns",
+                             "",
+                             p.adj.signif)) %>% 
+  as_tbl_graph() %>% 
+  activate(edges) %>% 
+  left_join(meta_data, 
+            by = c("group2" = "full_condition")) %>% 
+  mutate(stimulation = factor(stimulation, c("Not stimulated", "MCP1", "Rantes")),
+         coated = factor(coated, c("In solution", "Immob"))) %>% 
+  activate(nodes) %>% 
+  mutate(component = group_components()) %>% 
+  filter(component == 1) 
+
+net_layout <- 
+  net_data %>%
+  # mutate(centrality = centrality_degree()) %>% arrange(centrality) %>% 
+  layout_with_focus(v = c(3))
+  
+# Change coordinates for CD37, CD50, and CD162 to make sure they don't overlap: 
+# 3,8,14
+#CD37
+net_layout$xy[8,2] <- 0.5
+net_layout$xy[8,1] <- -0.1
+
+#CD50
+net_layout$xy[14,2] <- -0.5
+net_layout$xy[14,1] <- -0.1
+
+#CD162
+net_layout$xy[3,2] <- 0
+net_layout$xy[3,1] <- 0.1
+
+
+net_data %>% 
+  activate(edges) %>% 
+  arrange(-estimate) %>% 
+  ggraph(layout = "manual", 
+         x = net_layout$xy[,1],
+         y = net_layout$xy[,2]) +
+  geom_edge_link(aes(width = abs(estimate), color = estimate,
+                     label = edge_label), 
+                 label_size = 1) +
+  # geom_node_point(aes(label = name)) +
+  geom_node_text(aes(label = name),
+                 size = 2) +
+  facet_grid(coated~stimulation) +
+  scale_edge_color_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                             limits = 16 * c(-1, 1)) +
+  scale_edge_width(range = c(0.25,1)) +
+  scale_x_continuous(expand = expansion(0.1)) +
+  scale_y_continuous(expand = expansion(0.1)) +
+  coord_fixed() +
+  theme_umap() +
+  theme(axis.title = element_blank(),
+        panel.border = element_blank())
+ggsave("results/uropod/Differentially colocalized markers network plot.png",
+       width = 9, height = 6)
+ggsave("results/uropod/Differentially colocalized markers network plot.pdf",
+       width = 9, height = 6)
+
+
+```
+
+
+### Some examples of Diff. Coloc.
+
+```{r}
+
+
+temp_test_data %>% 
+  filter(marker_1 == "CD162",
+         marker_2 == "CD50") %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  ggplot(aes(full_condition, pearson_z)) +
+  geom_hline(yintercept = 0, 
+             color = "gray") +
+  geom_violin(draw_quantiles = 0.5, 
+              fill = "gray90") +
+  geom_jitter(size = 0.1, 
+              alpha = 0.5) +
+  stat_compare_means(ref.group = "In solution - Not stimulated", label = "p.signif") +
+  theme_pg() +
+  facet_wrap(~contrast, nrow = 3) +
+  scale_y_continuous(expand = expansion(c(0.05, 0.15))) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 60))
+ggsave("results/uropod/diff coloc z uropod markers full cond CD162_50.pdf",
+       width = 3, height = 4)
+
+
+temp_test_data %>% 
+  filter(marker_1 == "CD18",
+         marker_2 == "CD50") %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  ggplot(aes(full_condition, pearson_z)) +
+  geom_hline(yintercept = 0, 
+             color = "gray") +
+  geom_violin(draw_quantiles = 0.5, 
+              fill = "gray90") +
+  geom_jitter(size = 0.1, 
+              alpha = 0.5) +
+  stat_compare_means(ref.group = "In solution - Not stimulated", label = "p.signif") +
+  theme_pg() +
+  facet_wrap(~contrast, nrow = 3) +
+  scale_y_continuous(expand = expansion(c(0.05, 0.15))) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 60))
+ggsave("results/uropod/diff coloc z uropod markers full cond CD18_CD50.pdf",
+       width = 3, height = 4)
+
+```
+
+## Colocalization Dim. Reds
+### Coloc UMAP & PCA
+
+```{r}
+
+diff_coloc_markers_umap <- 
+  coloc_wilcox_res %>% 
+  group_by(marker_1, marker_2) %>%  
+  filter(any(p.adj < 0.01 &
+               abs(estimate) > 5)) %>% 
+  select(marker_1, marker_2) %>% 
+  distinct()
+  
+
+coloc_umap <- 
+  temp_test_data %>% 
+  inner_join(diff_coloc_markers_umap) %>% 
+  select(sample_component, pearson_z, marker_1, marker_2) %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  spread(contrast, pearson_z, fill = 0) %>% 
+  column_to_rownames("sample_component") %>% 
+  uwot::umap(n_neighbors = 20) %>% 
+  as_tibble(rownames = "sample_component")
+
+
+
+coloc_umap %>% 
+  left_join(temp_test_data %>% 
+              filter(marker_1 %in% c("CD50", "CD37", "CD162"),
+                     marker_2 %in% c("CD50", "CD37", "CD162")) %>% 
+              group_by(sample_component) %>% 
+              summarise(sum_score = mean(pearson_z, na.rm = T))) %>% 
+  left_join(component_identities) %>% 
+  left_join(meta_data) %>% 
+  ggplot(aes(V1, V2, fill = sum_score)) +
+  geom_point(size = 1, shape = 21,
+             stroke = 0.1) +
+  coord_fixed() +
+  theme_umap() +
+  facet_grid(stimulation ~ coated) +
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")))
+ggsave("results/uropod/uropod UMAP.png",
+       width = 4, height = 4)
+
+  
+coloc_pca <- 
+  temp_test_data %>% 
+  inner_join(diff_coloc_markers_umap)%>% 
+  select(sample_component, pearson_z, marker_1, marker_2) %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  spread(contrast, pearson_z, fill = 0) %>% 
+  column_to_rownames("sample_component") %>% 
+  pcaMethods::pca(nPcs = 10)
+
+
+coloc_pca@scores %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  left_join(temp_test_data %>% 
+              filter(marker_1 %in% c("CD50", "CD37", "CD162"),
+                     marker_2 %in% c("CD50", "CD37", "CD162")) %>% 
+              group_by(sample_component) %>% 
+              summarise(sum_score = mean(pearson_z, na.rm = T))) %>% 
+  left_join(component_identities) %>% 
+  left_join(meta_data) %>% 
+  ggplot(aes(PC1, PC2, fill = sum_score)) +
+  geom_point(size = 1, shape = 21,
+             stroke = 0.1) +
+  coord_fixed() +
+  theme_umap() +
+  facet_grid(stimulation ~ coated) +
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")))
+ggsave("results/uropod/uropod PCA.png",
+       width = 4, height = 4)
+
+
+coloc_pca@scores[, 1:3] %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  left_join(component_identities) %>% 
+  left_join(meta_data) %>% 
+  gather(component, comp_val, matches("^PC")) %>% 
+  ggplot(aes(sample, comp_val)) +
+  geom_hline(yintercept = 0, 
+             color = "gray") +
+  geom_violin(draw_quantiles = 0.5) +
+  facet_grid(component~full_condition, scales = "free") +
+  theme_pg()
+ggsave("results/uropod/uropod PCs per sample.png",
+       width = 10, height = 15)
+
+```
+
+
+### Coloc diffusion
+
+```{r}
+
+library(destiny)
+
+dm <- 
+  temp_test_data %>% 
+  inner_join(diff_coloc_markers_umap) %>% 
+  select(sample_component, pearson_z, marker_1, marker_2) %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  spread(contrast, pearson_z, fill = 0) %>% 
+  column_to_rownames("sample_component") %>%
+  DiffusionMap(verbose = TRUE, n_eigs = 2)
+
+
+dm@eigenvectors %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  left_join(temp_test_data %>% 
+              filter(marker_1 %in% c("CD50", "CD37", "CD162"),
+                     marker_2 %in% c("CD50", "CD37", "CD162")) %>% 
+              group_by(sample_component) %>% 
+              summarise(sum_score = mean(pearson_z, na.rm = T))) %>% 
+  left_join(component_identities) %>% 
+  left_join(meta_data) %>% 
+  ggplot(aes(DC1, DC2, fill = sum_score)) +
+  geom_point(size = 1, shape = 21,
+             stroke = 0.1) +
+  coord_fixed() +
+  theme_umap() +
+  facet_grid(stimulation ~ coated) +
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")))
+ggsave("results/uropod/uropod DM.png",
+       width = 4, height = 7)
+
+
+
+```
+
+
+
+# Output Abundance, Polarization & Coloc plots
+
+## Venn Diagram
+```{r}
+
+DE_diff_markers <-
+  
+  DE_condition %>% 
+  group_by(marker) %>% 
+  filter(any(p_val_adj < 0.05 &
+               abs(avg_log2FC) > 0.3)) %>% 
+  pull(marker) %>% 
+  unique()
+
+coloc_diff_contrasts <-
+  coloc_wilcox_res %>% 
+  group_by(marker_1, marker_2) %>% 
+  filter(any(p.adj < 0.05 &
+               abs(estimate) > 5)) %>% 
+  select(marker_1, marker_2) %>% 
+  distinct()
+
+coloc_diff_markers <-
+  coloc_diff_contrasts %>% 
+  gather(i, marker) %>% 
+  pull(marker) %>% 
+  unique()
+
+pol_diff_markers <- 
+  polarization_wilcox_res %>% 
+  group_by(marker) %>% 
+  filter(any(p.adj < 0.05 &
+               abs(estimate) > 0.0125)) %>% 
+  pull(marker) %>% 
+  unique()
+
+list(abundance = DE_diff_markers, 
+     polarization = pol_diff_markers,
+     colocalization = coloc_diff_markers) %>% 
+  map(. %>% 
+        length)
+
+list(abundance = DE_diff_markers, 
+     polarization = pol_diff_markers,
+     colocalization = coloc_diff_markers) %>% 
+  map(. %>% enframe("i", "marker")) %>% 
+  bind_rows(.id = "test") %>% 
+  group_by(marker) %>% 
+  summarise(tests = paste(test, collapse = ";")) %>% 
+  arrange(tests, marker) %>% 
+  print(n = 50)
+
+list(abundance = DE_diff_markers, 
+     polarization = pol_diff_markers,
+     colocalization = coloc_diff_markers) %>% 
+  map(. %>% enframe("i", "marker")) %>% 
+  bind_rows(.id = "test") %>% 
+  group_by(marker) %>% 
+  summarise(tests = paste(test, collapse = ";")) %>% 
+  group_by(tests) %>% 
+  count() %>% 
+  ggplot(aes(1, n, fill = tests)) +
+  geom_col()
+
+overlapp_eulervenn <- 
+  eulerr::euler(list(abundance = DE_diff_markers,
+                     polarization = pol_diff_markers,
+                     colocalization = coloc_diff_markers), shape = "ellipse")
+
+overlapp_eulervenn %>% 
+  plot(quantities = TRUE)
+
+overlapp_eulervenn$ellipses %>% 
+  as_tibble(rownames = "test") %>% 
+  ggplot(aes(fill = test)) +
+  geom_ellipse(aes(x0 = h, y0 = k, a = a, b = b, angle = phi),
+               alpha = 0.5, 
+               color = NA) +
+  coord_fixed() +
+  theme_void()
+ggsave("results/uropod/localization sign overlap.pdf",
+       width = 4, height = 3)
+
+sign_hits_n <- 
+  list(abundance = DE_diff_markers, 
+       polarization = pol_diff_markers,
+       colocalization = coloc_diff_markers) %>% 
+  map(. %>% length())
+```
+
+## Contrast heatmaps
+
+```{r}
+p1_contrast <- 
+  coloc_wilcox_res %>% 
+  inner_join(coloc_diff_contrasts) %>% 
+  ungroup() %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  select(contrast, group2, estimate, p.adj, p.adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(group2 = factor(group2, condition_plot_order)) %>% 
+  ggplot(aes(contrast, group2, fill = estimate)) +
+  geom_tile() +
+  geom_text(data = . %>% 
+              filter(p.adj.signif != "ns"),
+            aes(label = p.adj.signif),
+            size = 2) +
+  coord_fixed() +
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       limits = 14 * c(-1, 1)) +
+  scale_x_discrete(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        legend.position = "bottom") +
+  labs(y = "Condition",
+       title = "Differentially colocalized markers",
+       subtitle = "Compared to Immobilized - unstimulated")
+
+p2_contrast <- 
+  polarization_wilcox_res %>% 
+  filter(marker %in% pol_diff_markers) %>% 
+  group_by(marker) %>% 
+  filter(any(p.adj < 0.05 &
+               abs(estimate) > 0.0125)) %>% 
+  select(marker, group2, estimate, p.adj, p.adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(group2 = factor(group2, condition_plot_order)) %>% 
+  ggplot(aes(marker, group2, fill = estimate)) +
+  geom_tile() +
+  geom_text(data = . %>% 
+              filter(p.adj.signif != "ns"),
+            aes(label = p.adj.signif),
+            size = 2) +
+  coord_fixed() +
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       limits = 0.04 * c(-1, 1)) +
+  scale_x_discrete(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        legend.position = "bottom") +
+  labs(y = "Condition",
+       title = "Differentially polarized markers",
+       subtitle = "Compared to Immobilized - unstimulated")
+
+p3_contrast <- 
+  
+  DE_condition %>% 
+  filter(marker %in% DE_diff_markers) %>% 
+  ungroup() %>% 
+  add_significance(p.col = "p_val_adj") %>% 
+  select(marker, ident, avg_log2FC, p_val_adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(ident = factor(ident, condition_plot_order)) %>% 
+  ggplot(aes(marker, ident, fill = avg_log2FC)) +
+  geom_tile() +
+  geom_text(data = . %>% 
+              filter(p_val_adj.signif != "ns"),
+            aes(label = p_val_adj.signif),
+            size = 2) +
+  coord_fixed() +
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       limits = 1.2 * c(-1, 1)) +
+  scale_x_discrete(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        legend.position = "bottom") +
+  labs(y = "Condition",
+       title = "Differentially abundant markers",
+       subtitle = "Compared to Immobilized - unstimulated")
+
+
+p3_contrast + p2_contrast + p1_contrast 
+
+ggsave("results/uropod/localization heatmaps.pdf",
+       width = 20, height = 5)
+```
+
+## Abs heatmaps
+
+```{r}
+p1_abs <- 
+  colocalization_scores %>% 
+  inner_join(coloc_diff_contrasts) %>% 
+  group_by(sample, marker_1, marker_2) %>% 
+  summarise(pearson_z = mean(pearson_z)) %>% 
+  ungroup() %>% 
+  left_join(meta_data) %>% 
+  left_join(coloc_wilcox_res,
+            by = c("marker_1", "marker_2", "full_condition" = "group2")) %>% 
+  
+  unite(contrast, marker_1, marker_2) %>% 
+  select(contrast, full_condition, pearson_z, p.adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  ggplot(aes(contrast, full_condition, fill = pearson_z)) +
+  geom_tile() +
+  geom_text(data = . %>%
+              filter(p.adj.signif != "ns"),
+            aes(label = p.adj.signif),
+            size = 2) +
+  coord_fixed() + 
+  scale_fill_gradientn(name = "MPX colocalization score",
+                       colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       limits = 14 * c(-1, 1)) +
+  scale_x_discrete(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        legend.position = "bottom") +
+  labs(y = "Condition",
+       title = "Differentially colocalized markers",
+       subtitle = "Compared to Immobilized - unstimulated")
+
+
+p2_abs <-
+  polarization_scores %>% 
+  filter(marker %in% pol_diff_markers) %>% 
+  group_by(sample, marker) %>% 
+  summarise(morans_i = mean(morans_i)) %>% 
+  ungroup() %>% 
+  left_join(meta_data) %>% 
+  left_join(polarization_wilcox_res,
+            by = c("marker", "full_condition" = "group2")) %>% 
+  select(marker, full_condition, morans_i, p.adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  ggplot(aes(marker, full_condition, fill = morans_i)) +
+  geom_tile() +
+  geom_text(data = . %>%
+              filter(p.adj.signif != "ns"),
+            aes(label = p.adj.signif),
+            size = 2) +
+  coord_fixed() + 
+  scale_fill_gradientn(name = "MPX polarity score",
+                       colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       limits = 0.06 * c(-1, 1)) +
+  scale_x_discrete(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        legend.position = "bottom") +
+  labs(y = "Condition",
+       title = "Differentially polarized markers",
+       subtitle = "Compared to Immobilized - unstimulated")
+
+
+p3_abs <-
+pg_data_comb_processed@assays$RNA@data[DE_diff_markers, ] %>% 
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, clr, -1) %>% 
+  separate(sample_component, into = c("sample", "component"), sep = "_") %>% 
+  group_by(sample, marker) %>% 
+  summarise(clr = mean(clr)) %>% 
+  ungroup() %>% 
+  left_join(meta_data) %>% 
+  left_join(DE_condition,
+            by = c("marker", "full_condition" = "ident")) %>% 
+  add_significance(p.col = "p_val_adj") %>% 
+  select(marker, full_condition, clr, p_val_adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  
+  ggplot(aes(marker, full_condition, fill = clr)) +
+  geom_tile() +
+  geom_text(data = . %>%
+              filter(p_val_adj.signif != "ns"),
+            aes(label = p_val_adj.signif),
+            size = 2) +
+  coord_fixed() + 
+  scale_fill_gradientn(name = "CLR counts",
+                       colours = (RColorBrewer::brewer.pal(9, "Reds"))) +
+  scale_x_discrete(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        legend.position = "bottom") +
+  labs(y = "Condition",
+       title = "Differentially abundant markers",
+       subtitle = "Compared to Immobilized - unstimulated")
+
+
+
+p3_contrast + p2_abs + p1_abs
+ggsave("results/uropod/localization heatmaps 2.pdf",
+       width = 20, height = 5)
+```
+
+
+## Volcano plots
+
+```{r}
+
+
+p1 <-
+  coloc_wilcox_res %>% 
+  mutate(significant = p.adj < 0.05) %>% 
+  left_join(meta_data, 
+            by = c("group2" = "full_condition")) %>% 
+  mutate(full_condition = factor(group2, condition_plot_order),
+         stimulation = factor(stimulation, c("Not stimulated", "MCP1", "Rantes")),
+         coated = factor(coated, c("In solution", "Immob"))) %>% 
+  ggplot(aes(estimate, -log10(p.adj), color = significant)) +
+  geom_vline(xintercept = 0,
+             color = "darkgray") +
+  geom_hline(yintercept = -log10(0.05),
+             color = "gray",
+             linetype = "dashed") +
+  geom_point(size = 0.1,
+             show.legend = F) +
+  geom_text(data = . %>% 
+              filter(significant) %>% 
+              mutate(estimate_sign = sign(estimate)) %>% 
+              group_by(full_condition, estimate_sign) %>% 
+              top_n(3, abs(estimate)),
+            aes(label = paste(marker_1, marker_2, sep = " - ")),
+            show.legend = F,
+            vjust = -1,
+            size = 2) +
+  scale_color_manual(values = c("TRUE" = "orangered",
+                                "FALSE" = "darkgray")) +
+  scale_x_continuous(limits = 14 * c(-1, 1)) +
+  scale_y_continuous(expand = expansion(c(0, 0.1))) +
+  facet_wrap(~full_condition, nrow = 3) +
+  # facet_grid(coated ~ stimulation) +
+  theme_pg()
+p1
+ggsave("results/uropod/Differentially colocalized markers volcano.png",
+       plot = p1,
+       width = 8, height = 8)
+ggsave("results/uropod/Differentially colocalized markers volcano.pdf",
+       plot = p1,
+       width = 8, height = 8)
+
+p2 <- 
+  polarization_wilcox_res %>% 
+  
+  mutate(significant = p.adj < 0.05) %>% 
+  left_join(meta_data, 
+            by = c("group2" = "full_condition")) %>% 
+  mutate(full_condition = factor(group2, condition_plot_order),
+         stimulation = factor(stimulation, c("Not stimulated", "MCP1", "Rantes")),
+         coated = factor(coated, c("In solution", "Immob"))) %>% 
+  ggplot(aes(estimate, -log10(p.adj), color = significant)) +
+  geom_vline(xintercept = 0,
+             color = "darkgray") +
+  geom_hline(yintercept = -log10(0.05),
+             color = "gray",
+             linetype = "dashed") +
+  geom_point(size = 0.1,
+             show.legend = F) +
+  geom_text(data = . %>% 
+              filter(significant) %>% 
+              mutate(estimate_sign = sign(estimate)) %>% 
+              group_by(full_condition, estimate_sign) %>% 
+              top_n(5, abs(estimate)),
+            aes(label = marker),
+            show.legend = F,
+            vjust = -1,
+            size = 2) +
+  scale_color_manual(values = c("TRUE" = "orangered",
+                                "FALSE" = "darkgray")) +
+  scale_x_continuous(limits = 0.05 * c(-1, 1),
+                     breaks = c(-0.05, 0, 0.05)) +
+  scale_y_continuous(expand = expansion(c(0, 0.1))) +
+  facet_wrap(~full_condition, nrow = 3) +
+  # facet_grid(coated ~ stimulation) +
+  theme_pg()
+p2
+
+ggsave("results/uropod/Differentially polarized markers volcano.png",
+       plot = p2,
+       width = 8, height = 8)
+ggsave("results/uropod/Differentially polarized markers volcano.pdf",
+       plot = p2,
+       width = 8, height = 8)
+
+
+
+
+p3 <- 
+  DE_condition %>%
+  mutate(significant = p_val_adj < 0.05) %>% 
+  left_join(meta_data, 
+            by = c("ident" = "full_condition")) %>% 
+  mutate(full_condition = factor(ident, condition_plot_order),
+         stimulation = factor(stimulation, c("Not stimulated", "MCP1", "Rantes")),
+         coated = factor(coated, c("In solution", "Immob"))) %>% 
+  ggplot(aes(avg_log2FC, -log10(p_val_adj), color = significant)) +
+  geom_vline(xintercept = 0,
+             color = "darkgray") +
+  geom_hline(yintercept = -log10(0.05),
+             color = "gray",
+             linetype = "dashed") +
+  geom_point(size = 0.1,
+             show.legend = F) +
+  geom_text(data = . %>% 
+              filter(significant) %>% 
+              mutate(estimate_sign = sign(avg_log2FC)) %>% 
+              group_by(full_condition, estimate_sign) %>% 
+              top_n(5, abs(avg_log2FC)),
+            aes(label = marker),
+            show.legend = F,
+            vjust = -1,
+            size = 2) +
+  scale_color_manual(values = c("TRUE" = "orangered",
+                                "FALSE" = "darkgray")) +
+  scale_x_continuous(limits = 4 * c(-1, 1)) +
+  scale_y_continuous(expand = expansion(c(0, 0.1))) +
+  facet_wrap(~full_condition, nrow = 3) +
+  # facet_grid(coated ~ stimulation) +
+  theme_pg()
+p3
+ggsave("results/uropod/Differentially abundant markers volcano.png",
+       plot = p3,
+       width = 8, height = 8)
+ggsave("results/uropod/Differentially abundant markers volcano.pdf",
+       plot = p3,
+       width = 8, height = 8)
+
+
+p3 / p2 / p1
+
+ggsave("results/uropod/Differentially ab-pol-coloc markers volcano combined.pdf",
+       width = 8, height = 24)
+
+
+  
+
+```
+
+# Compare spatial to Abund.
+
+```{r}
+
+
+plot <- 
+  full_join(polarization_wilcox_res %>% 
+              select(full_condition = group2, marker, pol_diff = estimate, pol_p_val_adj = p.adj),
+            DE_condition %>% 
+              select(full_condition = ident, marker, avg_log2FC, ab_p_val_adj = p_val_adj)) %>% 
+  
+  # filter(!complete.cases(.))
+  mutate(sign_type = case_when(ab_p_val_adj < 0.05 & abs(avg_log2FC) > 0.3 &
+                                 pol_p_val_adj < 0.05 & abs(pol_diff) > 0.0125 ~ "Both sign.",
+                               ab_p_val_adj < 0.05 & abs(avg_log2FC) > 0.3 ~ "Sign. diff. Ab.",
+                               pol_p_val_adj < 0.05 & abs(pol_diff) > 0.0125 ~ "Sign. diff. Pol.",
+                               T ~ "Not significant"),
+         avg_log2FC = ifelse(is.na(avg_log2FC), 0, avg_log2FC),
+         full_condition = factor(full_condition, condition_plot_order)) %>% 
+  arrange(full_condition) %>% 
+  mutate(full_condition = str_replace(full_condition, " - ", "\n"),
+         full_condition = factor(full_condition, unique(full_condition))) %>% 
+  ggplot(aes(pol_diff, avg_log2FC, color = sign_type)) +
+  geom_hline(yintercept = 0,
+             color = "gray85") +
+  geom_vline(xintercept = 0,
+             color = "gray85") +
+  geom_point(alpha = 0.7,
+             size = 0.1) +
+  geom_text(data = . %>% 
+              filter(sign_type != "Not significant"),
+            aes(label = marker),
+            size = 3,
+            vjust = 1.5) +
+  scale_color_manual(values = c("Both sign." = "violet",
+                               "Sign. diff. Ab." = "coral3",
+                               "Sign. diff. Pol." = "cyan4",
+                               "Not significant" = "gray")) +
+  scale_x_continuous(expand = expansion(0.1)) +
+  scale_y_continuous(expand = expansion(0.1),
+                     limits = c(-1.2, 1.2)) +
+  facet_wrap(~full_condition, ncol = 1, strip.position = "right") +
+  theme_pg() +
+  labs(title = "Abundance vs Polarization effect",
+       x = "Polarity score (difference)",
+       y = "Abundance (log2FC)")
+plot
+ggsave("results/uropod/polarization vs abundance effect.pdf",
+       plot  = plot,
+       width = 5, height = 12)
+
+```
+
+
+# Visualize some uropod components
+
+```{r}
+
+
+polarization_scores %>% 
+  filter(marker %in% c("CD37", "CD50", "CD162", "CD11a", "CD18")) %>% 
+  filter(full_condition == "Immob - Rantes") %>% 
+  select(sample_component, morans_z, marker) %>% 
+  spread(marker, morans_z) %>% 
+  column_to_rownames("sample_component") %>% 
+  pheatmap()
+
+
+
+
+colocalization_scores %>% 
+  filter(marker_1 %in% c("CD37", "CD50", "CD162", "CD11a", "CD18")) %>% 
+  filter(marker_2 %in% c("CD37", "CD50", "CD162", "CD11a", "CD18")) %>% 
+  filter(full_condition == "Immob - Rantes") %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  select(sample_component, pearson_z, contrast) %>% 
+  spread(contrast, pearson_z) %>% 
+  column_to_rownames("sample_component") %>% 
+  pheatmap()
+
+polarization_scores %>% 
+  filter(marker %in% c("CD162","CD18")) %>% 
+  filter(full_condition == "Immob - Rantes") %>% 
+  select(sample_component, morans_z, marker) %>% 
+  spread(marker, morans_z) %>% 
+  arrange(-CD18)%>% 
+  print(n = 30)
+ggplot(aes(CD162, CD18)) +
+  geom_point()
+
+colocalization_scores %>% 
+  filter(marker_1 %in% c("CD37", "CD50", "CD162", "CD11a", "CD18")) %>% 
+  filter(marker_2 %in% c("CD37", "CD50", "CD162", "CD11a", "CD18")) %>% 
+  filter(full_condition == "Immob - Rantes") %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  select(sample_component, pearson_z, contrast) %>% 
+  spread(contrast, pearson_z) %>% 
+  filter(CD18_CD50 < -10,
+         CD37_CD50 > 10,
+         CD11a_CD18 > 0) %>% 
+  arrange(-(CD37_CD50-CD18_CD50/3))
+
+
+plot_components <- 
+  c("S3_RCVCMP0000192",
+    "S3_RCVCMP0000282",
+    "S3_RCVCMP0000263",
+    "S3_RCVCMP0000458",
+    "S3_RCVCMP0000448",     
+    "S3_RCVCMP0000095") %>% 
+  str_remove(".*_")
+
+edgelist <- 
+  edgelists$S3 %>% 
+  filter(component %in% plot_components)
+  
+
+component_counts <- 
+  edgelist %>% 
+  group_by(component, upia, marker) %>% 
+  count() %>% 
+  ungroup() %>% 
+  spread(marker, n, fill = 0) %>% 
+  gather(marker, n, -1, -2) %>% 
+  group_by(component, upia) %>% 
+  mutate(rel = n / sum(n),
+         clr = log(n + 1) - mean(log(n + 1)),
+         rel_clr = log(clr + 1) - mean(log(clr + 1))) %>% 
+  filter(!str_detect(marker, "^BC"))
+
+
+simple_graph <- 
+  plot_components %>% 
+  set_names(.,.) %>% 
+  lapply(function(comp) {
+    edgelist %>% 
+      filter(component == comp) %>% 
+      select(upia, upib) %>% 
+      distinct() %>% 
+      edgelist_to_simple_bipart_graph()
+  }) 
+
+graph_layout <- 
+  simple_graph %>% 
+  map(. %>% 
+        {
+          ingraph <- .;
+          layout_with_kk(ingraph, dim = 2) %>% 
+            as_tibble() %>% 
+            mutate(upia = as_tibble(ingraph)$name) 
+        }) %>% 
+  bind_rows(.id = "component") %>% 
+  
+  left_join(component_counts)
+
+
+
+graph_layout <- 
+  graph_layout %>% 
+  left_join(simple_graph %>% 
+              map(. %>% 
+                    as_tibble()) %>% 
+              bind_rows(.id = "component"),
+            by = c("component", "upia" = "name")) 
+
+
+graph_layout %>% 
+  filter(node_type == "A") %>% 
+  select(component, V1, V2, upia) %>% 
+  distinct() %>% 
+  ggplot(aes(V1, V2)) +
+  geom_point() +
+  facet_wrap(~component) +
+  coord_fixed() +
+  theme_pg()
+
+
+
+
+
+
+######
+plot_data <- 
+  graph_layout %>% 
+  filter(component %in% plot_components) %>% 
+  select(component, V1, V2, upia) %>% 
+  distinct() %>% 
+  group_by(component) %>% 
+  mutate(centroid_V1 = mean(V1),
+         centroid_V2 = mean(V2)) %>% 
+  ungroup() %>% 
+  mutate(centroid_dist = sqrt((V1 - centroid_V1)^2 + (V2 - centroid_V2)^2)) %>% 
+  group_by(component) %>% 
+  mutate(rank = rank(-centroid_dist),
+         part = rank/max(rank)) 
+
+plot_data %>% 
+  ggplot(aes(part, centroid_dist)) + 
+  geom_point() +
+  geom_vline(xintercept = 0.05,
+             linetype = "dashed")
+
+graph_layout_adjusted <- 
+  plot_data %>% 
+  group_by(component) %>% 
+  mutate(scale_factor = min(centroid_dist[which(part <0.05)])) %>% 
+  ungroup() %>% 
+  mutate(V1_adj = (V1 - centroid_V1) / scale_factor,
+         V2_adj = (V2 - centroid_V2) / scale_factor) 
+
+graph_layout_adjusted %>% 
+  ggplot(aes(V1_adj, V2_adj)) +
+  geom_point() +
+  facet_wrap(~component) +
+  coord_fixed() +
+  theme_pg()
+
+
+plot_data <- 
+  graph_layout %>% 
+  filter(component %in% plot_components) %>%
+  left_join(graph_layout_adjusted %>% 
+              select(component, V1_adj, V2_adj, upia)) %>% 
+  arrange(n) %>% 
+  # filter(marker %in% uropod_markers) %>%
+  inner_join(c("CD162", "CD50", "CD3E", "CD45", "CD37") %>% 
+               enframe("i", "marker") %>% 
+               mutate(marker_type = ifelse(marker %in% c("CD3E", "CD45"),
+                                           "Background", "Uropod"))) %>%
+  group_by(component, marker) %>% 
+  # mutate(color = scales::rescale(log10(n + 1), 0:1)) %>% 
+  mutate(color = scales::rescale(log10(n+1), 0:1)) 
+
+
+
+plot <- 
+  plot_data %>% 
+  mutate(component = str_remove(component, "RCVCMP") %>% as.numeric) %>% 
+  ggplot(aes(V1_adj, V2_adj, color = color)) +
+  # geom_density_2d() +
+  # stat_summary_2d(bins = 40) +
+  ggrastr::geom_point_rast(size = 0.1) +
+  facet_grid(marker_type + marker ~ component) +
+  scale_color_viridis(option = "inferno") +
+  # scale_color_gradient(low = "white", high = "orangered", limits = 0:1) +
+  coord_fixed() +
+  scale_x_continuous(limits = max(abs(plot_data$V1_adj)) * c(-1, 1),
+                     expand = expansion(0.015)) +
+  scale_y_continuous(limits = max(abs(plot_data$V2_adj)) * c(-1, 1),
+                     expand = expansion(0.015)) +
+  theme_void() +
+  theme(panel.spacing = unit(0, "mm"))
+
+plot
+ggsave("results/uropod/uropod graph fewer examples S3 adj.png",
+       plot = plot,
+       width = 10, height = 7)
+ggsave("results/uropod/uropod graph fewer examples S3 adj.pdf",
+       plot = plot,
+       width = 10, height = 7)
+
+
+
+```
+
