@@ -1,0 +1,1360 @@
+---
+title: "Unstimulated PBMC analysis"
+author: "Max Jonatan Karlsson"
+date: "2023-05-08"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+## Set directory
+
+```{r}
+
+knitr::opts_knit$set(root.dir = "C:/Users/Max/Documents/Pixelgen/Projects/2023-technical-manuscript/")
+
+```
+
+
+## Load packages 
+
+```{r message=FALSE, warning=FALSE, include=TRUE}
+
+# Framework packages
+library(tidyverse)
+library(Seurat)
+
+# Visualization packages
+library(patchwork)
+library(viridis)
+library(ggforce)
+library(pheatmap)
+library(plotly)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(graphlayouts)
+library(ggplotify)
+
+# Statistics packages
+library(ggpubr)
+library(rstatix)
+library(broom)
+
+# Utility packages
+library(pbapply)
+
+source("scripts/utility.R")
+source("scripts/theme.R")
+
+```
+
+
+## Manage data
+
+First, we convert the .pxl AnnData files to Seurat format, so we can use the standard Seurat functions for data analysis.  
+
+### Convert pxl Anndata files
+
+```{r}
+# The folders the data is located in:
+data_folders <- 
+  c("C:/Users/Max/data/pixelgen/PGseq95/0.12.0/analysis/")
+
+
+# Create data frame containing data file information
+data_files <-
+  data_folders %>% 
+  list.files(full.names = T,
+             recursive = T) %>% 
+  enframe("i", "filename") %>% 
+  filter(str_detect(filename, "dataset.pxl$"))  %>% 
+  mutate(dataset = str_extract(filename, "PGseq\\d{1,2}"),
+         full_id = str_remove(filename, ".*\\/") %>% 
+           str_remove("\\..*"),
+         sample =  str_extract(full_id, "_S\\d_") %>% 
+           str_remove_all("_"),
+         rds_file = paste0(filename, ".rds")) %>% 
+  filter(sample %in% paste0("S", 1:2))
+
+# Save file meta data
+
+data_files %>% 
+  write_csv("results/unstimulated/data files.csv")
+
+# Convert each .pxl AnnData file to Seurat and save an .rds file 
+# that is easily loaded in R
+for(i in 1:nrow(data_files)) {
+  
+  filename = data_files$filename[i]
+  newfilename = data_files$rds_file[i]
+  message(paste("Converting:", filename))
+  
+  if(file.exists(newfilename)) {
+    message("Converted file already exists\n")
+    next
+  }
+  
+  convert_pixelgenh5_seuratrds(filename, newfilename)
+}
+```
+
+### Define meta data
+
+Create a data frame containing meta data. 
+
+```{r}
+
+# Create a meta data table from the data file information
+meta_data <-
+  data_files %>% 
+  select(sample, dataset, full_id) %>% 
+  mutate(replicate = paste0("r", 1:2))
+
+# Save meta data
+meta_data %>% 
+  write_csv("results/unstimulated/unstimulated meta data.csv")
+
+
+```
+
+
+### AnnData file
+
+The AnnData file is stored in the .dataset.pxl file, and we previously converted it to a Seurat object and saved it as .rds to make it easy to retrieve. 
+
+```{r message=FALSE, warning=FALSE}
+# AnnData
+pg_data <- 
+  data_files %>% 
+  select(sample, rds_file) %>% 
+  deframe() %>% 
+  lapply(readRDS)
+```
+
+We extract the component meta data and put it in a separate data frame for easy access. 
+
+```{r message=FALSE, warning=FALSE}
+# Metrics
+metrics_data <- 
+  pg_data %>% 
+  map(. %>% 
+        {.@meta.data} %>% 
+        as_tibble(rownames = "component")) %>% 
+  bind_rows(.id = "sample")
+```
+
+### Edge list
+
+The edge list contains the whole Molecular Pixelation graph, where each row corresponds to a unique read, and an edge in the bipartite graph. It has been used for previous stages such as multiplet recovery, polarization, and colocalization score calculations. 
+
+```{r message=FALSE, warning=FALSE}
+# Edgelists
+edgelists <-
+  data_files %>%
+  with(set_names(filename, sample)) %>%
+  pblapply(read_edgelist)
+```
+
+### Polarization and colocalization scores
+
+The polarization and colocalization score files are tables of statistics calculated to estimate the spatial properties of markers in each individual component. 
+The polarization score consists of Moran's I, which estimates the degree of non-random spatial distribution, where high score indicates more spatial structure. 
+The colocalization scores consist of Jaccard index, and Pearson correlation, both calculated between pairs of markers, and across local neighborhoods of adjacent A pixels in each component. High score indicates colocalization of the two markers, while low score indicates that they do not have a spatial relationship.
+
+```{r message=FALSE, warning=FALSE}
+# Polarization & colocalization scores
+loc_scores <-
+  data_files %>%
+  with(set_names(filename, sample)) %>%
+  pblapply(read_pixeldata_item, items = c("colocalization", "polarization"))
+
+```
+
+## Analysis settings
+
+```{r}
+
+# Define some of the most important qc metrics for evaluating components
+metrics_of_interest <- 
+  c("edges", "antibodies", "umi_per_upia", "mean_reads")
+
+# Define some filters for refining cell calling
+component_filters <- 
+  list(minimum_edges = 4000, 
+       minimum_edge_rank = 11)
+
+
+
+cell_palette <- 
+  c("CD8 T cells" = "#4A6293",
+    "CD4 T cells" = "#314169",
+    "MAIT cells" = "#A6B2C8", 
+    "NK cells" = "#04806D",
+    "Monocytes" = "#E44C34", 
+    "B cells" = "#83348C",
+    "Dead cells" = "gray40")
+```
+
+# Quality Control
+
+Here we perform a quality control of the called cells, i.e. the components that have been labeled as real cells. This entails a manual refinement of the cell calling based on measured cell size by number of edges (number of unique detected antibodies), as well as removal of technical outliers. 
+
+## Edge rank plot
+
+The edge rank plot is used to call cells in a previous cell calling step in Pixelator. Here, we inspect it again and apply additional filters to remove cells that deviate from the component size distribution.
+
+In this plot, the used cutoffs are marked as dashed lines, and components that are deviating more than two standard deviations from the mean (number of edges) are marked in gray. 
+
+```{r}
+plot_data <- 
+  metrics_data %>% 
+  group_by(sample) %>% 
+  mutate(rank = rank(-edges, ties.method = "random"), 
+         mean_edges = mean(log10(edges)),
+         sd_edges = sd(log10(edges)),
+         edges_deviation = (log10(edges) - mean_edges) / sd_edges) %>% 
+  left_join(meta_data,
+            by = "sample") %>% 
+  ungroup()
+
+plot_data %>% 
+  ggplot(aes(rank, edges, color = sample)) +
+  geom_point(size = 0.5) +
+  geom_hline(yintercept = component_filters$minimum_edges,
+             linetype = "dashed") +
+  geom_vline(xintercept = component_filters$minimum_edge_rank,
+             linetype = "dashed") +
+  # scale_y_log10() +
+  scale_x_log10(breaks = c(1, 10, 100, 500)) +
+  labs(x = "Component rank (by number of edges)",
+       y = "Number of edges") +
+  theme_pg() 
+
+ggsave("results/unstimulated/edge rank plot.png",
+       width = 7, height = 5)
+ggsave("results/unstimulated/edge rank plot.png",
+       width = 7, height = 5)
+```
+
+
+
+Here we make a table saving the information of which cells we want to keep for further analysis.
+
+```{r}
+called_cells <- 
+  plot_data %>% 
+  filter(edges >= component_filters$minimum_edges,
+         rank >= component_filters$minimum_edge_rank)
+
+cat(paste("Out of", nrow(plot_data), "cells,", nrow(called_cells), "were called."))
+
+```
+
+Here we plot the number of called cells per condition and replicate. The target of 500 cells is marked as a dashed line. 
+
+```{r}
+
+
+called_cells %>% 
+  group_by(sample) %>% 
+  count() %>% 
+  left_join(meta_data,
+            by = c("sample")) %>% 
+  ggplot(aes(sample, n)) +
+  geom_hline(yintercept = 500,
+             linetype = "dashed") +
+  geom_col(position = position_dodge()) +
+  geom_text(aes(label = n),
+            vjust = -0.5) +
+  scale_y_continuous(expand = expansion(c(0, 0.1))) +
+  theme_pg() +
+  theme(panel.border = element_blank()) +
+  labs(title = "Number of called cells")
+ggsave("results/unstimulated/nbr called cells.png",
+       width = 4, height = 3)
+ggsave("results/unstimulated/nbr called cells.pdf",
+       width = 4, height = 3)
+
+
+```
+
+## Inspect component metrics
+
+### Metrics of interest
+
+```{r}
+
+metrics_data %>% 
+  inner_join(called_cells %>% 
+               select(sample, component),
+             by = c("sample", "component")) %>% 
+  select(1, 2, all_of(metrics_of_interest)) %>% 
+  gather(metric, value, -1, -2) %>% 
+  left_join(meta_data, 
+            by = "sample") %>% 
+  ggplot(aes(sample, value)) +
+  geom_violin(draw_quantiles = 0.5, 
+              fill = "gray") + 
+  facet_grid(metric ~ ., scales = "free") +
+  scale_y_log10() +
+  theme_pg()
+ggsave("results/unstimulated/metrics of interest violin.png",
+       width = 10, height = 7)
+ggsave("results/unstimulated/metrics of interest violin.pdf",
+       width = 10, height = 7)
+
+
+
+```
+
+### Pixel content vs Marker specificity
+
+Rarily, antibodies form aggregates, which manifest themselves as outliers in Molecular Pixelation data. These usually have either high complexity, consisting of many random antibodies, or low complexity, mainly constituting a single antibody. We detect these by using a metric Tau, which ranges from 0, indicating equal distribution of counts across all antibodies, to 1, indicating all counts distributed to a single antibody. Additionally, aggregates often have dense pixels with a lot of antibodies detected per each pixel, which can be measured using the umi_per_upia metric, which is stored in the component meta data.
+
+Here we have plotted umi_per_upia against Tau, and colored each component by Pixelator's classification of Tau (low, normal, or high). It looks like Pixelator has accurately picked out a few outliers that might be antibody aggregates or components that has low specificity, binding many more different types of antibodies than we would expect from a normal cell. We will remove these from the analysis as well.  
+
+```{r}
+metrics_data %>% 
+  inner_join(called_cells %>% 
+               select(sample, component),
+             by = c("sample", "component")) %>% 
+  left_join(meta_data,
+            by = c("sample")) %>% 
+  ggplot(aes(tau, umi_per_upia, color = tau_type)) +
+  geom_point() +
+  theme_pg() +
+  facet_grid(~ sample) +
+  scale_y_log10() +
+  scale_color_manual(values = c("high" = "orangered2", "low" = "skyblue3", "normal" = "gray")) +
+  labs(x = "Marker specificity (Tau)",
+       y = "Pixel content (UMI/UPIA)")
+ggsave("results/unstimulated/tau vs pixel content.png",
+       width = 12, height = 7)
+ggsave("results/unstimulated/tau vs pixel content.pdf",
+       width = 12, height = 7)
+
+
+```
+
+Here we save a data frame with the cells that are deemed normal. 
+
+```{r}
+
+cleaned_cells <-
+  called_cells %>% 
+  filter(tau_type == "normal")
+
+cat(paste("Out of", nrow(called_cells), "cells,", nrow(cleaned_cells), "were kept"))
+```
+
+### Metrics for called cells
+
+```{r}
+
+plot_data <- 
+  metrics_data %>% 
+  inner_join(called_cells %>% 
+               select(sample, component),
+             by = c("sample", "component")) %>% 
+  select(1, 2, all_of(c("edges", "umi_per_upia", "reads", "upia", "upib"))) %>% 
+  gather(metric, value, -1, -2) %>% 
+  mutate(metric = factor(metric, c("reads", "edges", "upia", "upib", "umi_per_upia"))) %>% 
+  left_join(meta_data, 
+            by = "sample") 
+plot_meta <-
+  plot_data %>% 
+  group_by(metric) %>% 
+  summarise(average = median((value)))
+
+plot_data %>% 
+  ggplot(aes(value)) +
+  geom_histogram(aes(fill = replicate), 
+                 position = position_identity(),
+                 bins = 15,
+                 alpha = 0.5) + 
+  geom_vline(data = plot_meta,
+             aes(xintercept = average),
+             linetype = "dashed") +
+  geom_text(data = plot_meta, 
+            aes(average, 110, label = round(average, 1)),
+            hjust = -0.1) +
+  facet_wrap( ~ metric, scales = "free_x") +
+  scale_x_log10() +
+  scale_y_continuous(expand = expansion(c(0, 0.1))) +
+  theme_pg() + 
+  labs(x = "Value", 
+       y = "Number of cells")
+
+ggsave("results/unstimulated/metrics of called cells distribution.png",
+       width = 10, height = 7)
+ggsave("results/unstimulated/metrics of called cells distribution.pdf",
+       width = 10, height = 7)
+
+```
+
+
+
+
+## Clean data
+
+### Filter data
+
+### Select features
+
+Some markers are unused barcodes (named e.g. BC11 in the data). Let's select only markers we are using in the assay.
+
+```{r}
+
+marker_types <-
+  pg_data$S2@assays$RNA %>% 
+  rownames() %>% 
+  enframe("i", "marker") %>% 
+  mutate(marker_type = case_when(str_detect(marker, "^BC\\d") ~ "Empty BC",
+                                 str_detect(marker, "^mIgG") ~ "Isotype ctrl",
+                                 T ~ "Normal")) 
+
+selected_features <-
+  marker_types %>% 
+  filter(marker_type != "Empty BC") %>% 
+  pull(marker) 
+
+selected_features %>% 
+  sort() %>% 
+  paste(collapse = ", ") %>% 
+  cat()
+
+pca_features <- 
+  marker_types %>% 
+  filter(marker_type == "Normal") %>% 
+  filter(!marker %in% c("TCRb", "CD41", "CD9", "CD36", "CD29", "ACTB", "CD62P")) %>% 
+  pull(marker)
+
+```
+
+
+### Remove cells and empty barcodes
+
+Here we filter the data to only keep the cells we have selected, and the markers that we selected in the previous step. 
+
+```{r}
+
+keep_cells <- 
+  cleaned_cells %>% 
+  mutate(cell_id = paste(sample, component, sep = "_"))
+
+# Merge Seurat objects 
+pg_data_comb <- 
+  merge(pg_data[[1]],
+        y = pg_data[-1],
+        add.cell.ids = names(pg_data)) 
+
+
+# Keep only cells and features we have selected previously
+pg_data_comb[["cell_id"]] <- colnames(pg_data_comb)
+
+pg_data_comb <- 
+  pg_data_comb %>% 
+  subset(subset = cell_id %in% keep_cells$cell_id) %>% 
+  subset(features = selected_features)
+
+# Add some meta data directly to the Seurat object. We will need this later.
+# Sample ID (e.g. S3)
+pg_data_comb[["sample"]] <- str_remove(colnames(pg_data_comb), "_RCVCMP.*")
+
+# Replicate
+pg_data_comb[["replicate"]] <- meta_data$replicate[match(pg_data_comb$sample, meta_data$sample)]
+
+
+
+```
+
+### Isotype abundance
+
+```{r}
+plot_data <- 
+  pg_data_comb@assays$RNA@counts %>% 
+  sweep(2, apply(., 2, sum), "/") %>% 
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, rel, -1) %>% 
+  filter(str_detect(marker, "^mIg") | marker == "ACTB") 
+
+plot_meta <- 
+  plot_data %>% 
+  group_by(marker) %>% 
+  summarise(median = median(100*rel))
+
+plot_data %>% 
+  ggplot(aes(marker, 100 * rel)) +
+  geom_violin(draw_quantiles = 0.5) +
+  geom_text(data = plot_meta, 
+            aes(y = median, label = paste(round(median, 2), "%")),
+            nudge_x = 0.3,
+            size = 2,
+            hjust = 0) +
+  theme_pg() +
+  scale_y_continuous(limits = c(0, 3)) +
+  labs(x = "Isotype marker",
+       y = "% counts")
+ggsave("results/unstimulated/Isotype abundance.png",
+       width = 4, height = 4)
+ggsave("results/unstimulated/Isotype abundance.pdf",
+       width = 4, height = 4)
+
+```
+
+# Analysis (all cells)
+
+## Select features
+
+```{r}
+selected_markers <- 
+  pg_data_comb@assays$RNA@counts %>% 
+  log1p() %>% 
+  apply(MARGIN = 1, mean) %>% 
+  exp() %>% 
+  `-`(1) %>% 
+  sort() %>% 
+  enframe() %>% 
+  mutate(selected = !(str_detect(name, "^mIg") | name == "TCRb"))
+
+```
+
+
+## Data processing
+
+
+### Remove platelets and dead cells
+
+```{r}
+temp_data <- 
+  pg_data_comb %>% 
+  # CLR transform data: 
+  NormalizeData(normalization.method = "LogNormalize")# %>%
+
+VlnPlot(temp_data, features = "CD45") +
+  geom_hline(yintercept = 6,
+             linetype = "dashed")
+
+VlnPlot(temp_data, features = "ACTB") +
+  geom_hline(yintercept = 2.5,
+             linetype = "dashed")
+
+VlnPlot(temp_data, features = c("mIgG1")) +
+  geom_hline(yintercept = 2.5,
+             linetype = "dashed")
+
+VlnPlot(temp_data, features = c("mIgG2a")) +
+  geom_hline(yintercept = 4,
+             linetype = "dashed")
+
+VlnPlot(temp_data, features = c("mIgG2b")) +
+  geom_hline(yintercept = 2.5,
+             linetype = "dashed")
+
+
+```
+
+
+### Process data
+
+```{r}
+
+pg_data_comb_processed <-
+  temp_data %>% 
+  
+  # Remove platelets
+  subset(subset = CD45 > 6) %>% 
+  # Remove possibly dead cells
+  subset(subset = ACTB < 2.5) %>%
+  subset(subset = mIgG1 < 2.5) %>%
+  subset(subset = mIgG2a < 4) %>%
+  subset(subset = mIgG2b < 2.5) %>%
+  
+  subset(features = selected_markers$name[which(selected_markers$selected)]) %>% 
+  
+  
+  # clr transform data: 
+  NormalizeData(normalization.method = "CLR", 
+                margin = 2) %>%
+  
+  # AddMetaData(metadata = log10(.@meta.data$edges), col.name = 'logedges') %>% 
+   
+  # Find variable features
+  FindVariableFeatures(nfeatures = 40, ) %>%
+  
+  ScaleData(scale.max = Inf, 
+            do.scale = T, 
+            do.center = T, 
+            # vars.to.regress = c("logedges"),
+            verbose = F) %>% 
+  # RunPCA(npcs = 30) %>%
+  # Remove platelet markers from PCA:
+  RunPCA(npcs = 30, features = pca_features) %>%
+  RunUMAP(umap.method = "uwot",
+          min.dist = 0.1,
+          spread = 2,
+          n.neighbors = 25,
+          dims = 1:12) 
+
+VariableFeaturePlot(pg_data_comb_processed, selection.method = "vst") +
+  geom_text(data = . %>% 
+              as_tibble(rownames = "marker"),
+            aes(label = marker, color = colors),
+            size = 2,
+            vjust = -0.5) +
+  theme(plot.background = element_rect(fill = "white", color = NA))
+ggsave("results/unstimulated/variable variance plot.png",
+       width = 7, height = 4)
+ggsave("results/unstimulated/variable variance plot.pdf",
+       width = 7, height = 4)
+
+# Visualize scaled data distribution: 
+pg_data_comb_processed@assays$RNA@data %>% 
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, scaled_value, -1) %>% 
+  ggplot(aes(scaled_value)) +
+  geom_density(fill = "gray", alpha = 0.2) +
+  geom_vline(data = . %>% 
+               summarise(scaled_value = mean(scaled_value)),
+             aes(xintercept = scaled_value)) +
+  theme_pg()
+
+pg_data_comb_processed@assays$RNA@scale.data %>% 
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, scaled_value, -1) %>% 
+  ggplot(aes(scaled_value)) +
+  geom_density(fill = "gray", alpha = 0.2) +
+  geom_vline(data = . %>% 
+               summarise(scaled_value = mean(scaled_value)),
+             aes(xintercept = scaled_value)) +
+  theme_pg()
+
+pg_data_comb_processed@assays$RNA@scale.data %>% 
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, scaled_value, -1) %>% 
+  ggplot(aes(scaled_value, group = marker)) +
+  geom_density(fill = "gray", alpha = 0.2) +
+  theme_pg()
+
+
+# Get umap coords
+umap_data <- 
+  pg_data_comb_processed@reductions$umap@cell.embeddings %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  separate(sample_component, into = c("sample", "component"), remove = F) %>% 
+  left_join(meta_data) %>% 
+  left_join(metrics_data)
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = sample)) +
+  geom_point(size = 1) + 
+  coord_fixed() +
+  theme_umap()
+
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = sample)) +
+  geom_point(data = . %>% 
+               select(-sample),
+             color = "gray", 
+             size = 0.5) + 
+  geom_point(size = 1) + 
+  coord_fixed() +
+  facet_grid( ~ sample) +
+  theme_umap()
+
+
+# Control
+FeaturePlot(pg_data_comb_processed, features = c("ACTB",
+                                                 "HLA-ABC",
+                                                 "B2M", 
+                                                 "edges",
+                                                 "umi_per_upia",
+                                                 "tau",
+                                                 "antibodies",
+                                                 "reads"))
+
+
+# T cells
+FeaturePlot(pg_data_comb_processed, features = c("CD2", 
+                                                 "CD3E",
+                                                 "CD4",
+                                                 "CD8",
+                                                 "CD16",
+                                                 "CD161"))
+
+
+# Platelets
+FeaturePlot(pg_data_comb_processed, features = c("CD41",
+                                                 "CD9",
+                                                 "CD36"))
+
+
+# B cells
+FeaturePlot(pg_data_comb_processed, features = c("CD20",
+                                                 "CD19",
+                                                 "CD40"))
+
+
+# Monocytes
+FeaturePlot(pg_data_comb_processed, features = c("CD11b",
+                                                 "CD14",
+                                                 "CD11c"))
+
+
+```
+
+
+
+
+
+
+## Add cell ID module score
+
+Here we visualize the Seurat module scores of markers associated with certain cell types, as a check that we see the populations we expect and the clusters are pure. 
+
+```{r}
+pg_data_comb_processed <-
+  pg_data_comb_processed %>% 
+  AddModuleScore(features = list(c("CD19", "CD20", "CD40"),
+                                 c("CD3E", "CD4", "CD8", "CD5", "CD2"),
+                                 c("CD3E", "CD4"),
+                                 c("CD3E", "CD8"),
+                                 c("CD11b", "CD14", "CD11c"),
+                                 c("CD41", "CD9", "CD36"),
+                                 c("CD337", "CD2", "CD7", "CD161"),
+                                 c("CD3E", "CD16", "CD161", "CD26")),
+                 name = c("module_Bcells", 
+                          "module_Tcells",
+                          "module_CD4Tcells",
+                          "module_CD8Tcells",
+                          "module_Monocytes",
+                          "module_Platelets",
+                          "module_NKcells",
+                          "module_MAIT"),
+                 ctrl = 3) 
+
+
+umap_data <- 
+  pg_data_comb_processed@reductions$umap@cell.embeddings %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  separate(sample_component, into = c("sample", "component"), remove = F) %>% 
+  left_join(meta_data) %>% 
+  left_join(pg_data_comb_processed@meta.data %>% 
+              as_tibble(rownames = "sample_component"))
+
+plot_data <- 
+  umap_data %>%
+  gather(module, module_score, matches("^module_")) %>% 
+  mutate(module_i = str_extract(module, "\\d$"),
+         module_cell_type = str_remove(module, "\\d$") %>% str_remove("module_")) 
+
+plot_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = module_score)) +
+  geom_point(size = 1) + 
+  coord_fixed() +
+  theme_umap() +
+  facet_wrap(module_cell_type ~ .) +
+  scale_color_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                        limits = 4 * c(-1, 1))
+ggsave("results/unstimulated/UMAP module scores.png",
+       width = 8, height = 7)
+ggsave("results/unstimulated/UMAP module scores.pdf",
+       width = 8, height = 7)
+
+plot_data %>% 
+  group_by(sample_component, UMAP_1, UMAP_2) %>% 
+  top_n(1, module_score) %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = module_cell_type)) +
+  geom_point(size = 2) + 
+  coord_fixed() +
+  theme_umap() 
+
+
+
+```
+
+```{r}
+
+umap_data <- 
+  pg_data_comb_processed@reductions$umap@cell.embeddings %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  separate(sample_component, into = c("sample", "component"), remove = F) %>% 
+  left_join(meta_data) %>% 
+  left_join(metrics_data)
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = sample)) +
+  geom_point(size = 1) + 
+  coord_fixed() + facet_wrap(~sample) +
+  theme_umap()
+ggsave("results/unstimulated/UMAP sample.png",
+       width = 4, height = 3)
+
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = sample)) +
+  geom_point(data = . %>% 
+               select(-sample),
+             color = "gray", 
+             size = 0.5) + 
+  geom_point(size = 0.1) + 
+  coord_fixed() +
+  facet_grid( ~ sample) +
+  theme_umap()
+ggsave("results/unstimulated/UMAP sample separated.png",
+       width = 8, height = 5)
+
+
+```
+
+
+## Test UMAP settings
+
+```{r}
+
+# plot_umaps <-
+#   # seq(6, 30, 3) %>%
+#   c(5, 10, 15, 20, 25, 30) %>%
+#   # seq(6, 12, 2) %>%
+#   # c(0.5, 1, 1.5, 2, 3, 4) %>%
+#   # c(0.1, 0.2, 0.3, 0.4) %>%
+#   set_names(., .) %>%
+#   lapply(function(npcs) {
+# 
+#     pg_data_comb_processed %>%
+# 
+#       RunUMAP(umap.method = "uwot",
+#               min.dist = 0.1,
+#               spread = 2,
+#               n.neighbors = npcs,
+#               dims = 1:12) %>%
+#       {.@reductions$umap@cell.embeddings} %>%
+#       as_tibble(rownames = "sample_component")
+# 
+#   }) %>%
+#   bind_rows(.id = "npcs")
+# 
+# 
+# 
+# plot_umaps %>%
+#   separate(sample_component, into = c("sample", "component"), remove = F) %>%
+#   left_join(meta_data) %>%
+#   left_join(metrics_data) %>%
+#   mutate(npcs = as.numeric(npcs)) %>%
+#   ggplot(aes(UMAP_1, UMAP_2, color = sample)) +
+#   geom_point(size = 0.1) +
+#   coord_fixed() +
+#   facet_wrap(~npcs) +
+#   theme_umap()
+# 
+# 
+# plot_umaps %>%
+#   separate(sample_component, into = c("sample", "component"), remove = F) %>%
+#   left_join(meta_data) %>%
+#   left_join(metrics_data) %>%
+#   mutate(npcs = as.numeric(npcs), 
+#          dc = sample_component %in% plot_cells) %>%
+#   ggplot(aes(UMAP_1, UMAP_2, color = dc)) +
+#   geom_point(size = 2) +
+#   coord_fixed() +
+#   facet_wrap(~npcs) +
+#   theme_umap()
+
+```
+
+
+
+## Clustering
+
+```{r}
+
+for(res in seq(0.2, 2, 0.2)) {
+  pg_data_comb_processed <-
+    pg_data_comb_processed %>%
+    FindNeighbors(dims = 1:12, k.param = 20, prune.SNN = 1/15,
+                  n.trees = 100) %>%
+    FindClusters(resolution = res,
+                 method = "igraph",
+                 n.start = 40,
+                 algorithm = 2,
+                 random.seed = 42)
+
+}
+
+clustree::clustree(pg_data_comb_processed)
+
+pg_data_comb_processed <- 
+  pg_data_comb_processed %>% 
+  FindNeighbors(dims = 1:12, k.param = 20, prune.SNN = 1/15,
+                n.trees = 100) %>% 
+  FindClusters(resolution = 0.4, 
+               method = "igraph",
+               n.start = 40,
+               algorithm = 2, 
+               random.seed = 42)
+
+umap_data <- 
+  pg_data_comb_processed@reductions$umap@cell.embeddings %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  separate(sample_component, into = c("sample", "component"), remove = F) %>% 
+  left_join(meta_data) %>% 
+  left_join(pg_data_comb_processed@meta.data %>% 
+              as_tibble(rownames = "sample_component"))
+
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2)) +
+  geom_point(aes(color = seurat_clusters),
+             size = 1,
+             show.legend = F) + 
+  geom_point(data = . %>% 
+               group_by(seurat_clusters) %>% 
+               summarise(UMAP_1 = median(UMAP_1),
+                         UMAP_2 = median(UMAP_2)),
+             size = 5,
+             alpha = 0.5) +
+  geom_text(data = . %>% 
+              group_by(seurat_clusters) %>% 
+              summarise(UMAP_1 = median(UMAP_1),
+                        UMAP_2 = median(UMAP_2)),
+            size = 3,
+            aes(label = seurat_clusters), 
+            color = "white") +
+  coord_fixed() +
+  scale_color_brewer(type = "qual") +
+  theme_umap()
+ggsave("results/unstimulated/cluster umap.png",
+       width = 5, height = 5)
+ggsave("results/unstimulated/cluster umap.pdf",
+       width = 5, height = 5)
+
+umap_data %>% 
+  group_by(seurat_clusters) %>% 
+  count() %>% 
+  ggplot(aes(n, seurat_clusters)) +
+  geom_col() +
+  geom_text(aes(label = n), 
+            hjust = 0) +
+  theme_pg()
+
+
+```
+
+#### Find cluster identities
+
+To annotate the resulting clusters, we use a wilcox test to gauge which markers are differentially abundant between the clusters. 
+
+##### Differential Abundance analysis
+
+```{r}
+DE_cluster <- 
+  pg_data_comb_processed %>% 
+  SetIdent(value = "seurat_clusters") %>% 
+  FindAllMarkers(slot = "counts", # Use the normalized data slot
+                 min.pct = 0, 
+                 test.use = "wilcox", 
+                 logfc.threshold = 0, 
+                 return.thresh = Inf,
+                 max.cells.per.ident = 50) %>% 
+  as_tibble() 
+
+DE_cluster %>% 
+  ggplot(aes(avg_log2FC, -log10(p_val_adj),
+             color = p_val_adj < 0.01)) +
+  geom_point() +
+  theme_pg()
+
+write_csv(DE_cluster, "results/unstimulated/ab wilcox test.csv")
+```
+
+Here is a heatmp showing the estimated log2 fold change between cluster and background. 
+
+```{r, fig.width = 4, fig.height = 4}
+plot_data <-
+  DE_cluster %>% 
+  group_by(gene) %>% 
+  filter(any(p_val_adj < 0.01 & 
+               abs(avg_log2FC) > 2)) %>% 
+  select(avg_log2FC, cluster, gene) %>% 
+  spread(cluster, avg_log2FC) %>% 
+  column_to_rownames("gene")
+
+
+rg <- max(abs(plot_data))
+
+
+DE_cluster_heatmap <- 
+  plot_data %>% 
+  pheatmap(breaks = seq(-rg, rg, length.out = 100),
+           color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 11, 
+                                                                 name = "RdBu")))(100), 
+           cellwidth = 10, 
+           cellheight = 10)
+
+ggsave("results/unstimulated/cluster DE avg_diff heatmap.png",
+       plot = as.ggplot(DE_cluster_heatmap) +
+         theme(plot.background = element_rect(fill = "white", color = NA)),
+       width = 5, height = 10)
+ggsave("results/unstimulated/cluster DE avg_diff heatmap.pdf",
+       plot = as.ggplot(DE_cluster_heatmap) +
+         theme(plot.background = element_rect(fill = "white", color = NA)),
+       width = 5, height = 10)
+
+
+DE_cluster %>% 
+    group_by(gene) %>% 
+    filter(p_val_adj < 0.01 & 
+             abs(avg_log2FC) > 2) %>% 
+  group_by(cluster) %>% 
+  count()
+```
+
+Now finally, let's denote our interpretation of this heatmap as cell identities.
+
+```{r, fig.width = 4, fig.height = 5}
+# paste0("'", with(DE_cluster_heatmap$tree_col, labels[order]),
+#        "' = ''", collapse = ",\n") %>%
+#   cat()
+
+cell_annotation <- 
+  c('2' = 'B cells',
+    '5' = 'Monocytes',
+    '4' = 'NK cells',
+    '0' = 'CD4 T cells',
+    '1' = 'CD4 T cells',
+    '3' = 'CD8 T cells',
+    '6' = 'MAIT cells') %>% 
+  enframe("cluster", "cell_type_name") %>% 
+  mutate(cell_type = paste(cluster, cell_type_name))
+
+plot_data <-
+  DE_cluster %>% 
+  group_by(gene) %>% 
+  filter(any(p_val_adj < 0.01 & 
+               abs(avg_log2FC) > 2)) %>% 
+  left_join(cell_annotation) %>% 
+  select(avg_log2FC, cell_type, gene) %>% 
+  spread(cell_type, avg_log2FC) %>% 
+  column_to_rownames("gene")
+
+
+rg <- max(abs(plot_data))
+
+
+DE_cluster_heatmap_annotated <- 
+  plot_data %>% 
+  pheatmap(breaks = seq(-rg, rg, length.out = 100),
+           color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 11, 
+                                                                 name = "RdBu")))(100), 
+           cellwidth = 10, 
+           cellheight = 10)
+
+
+ggsave("results/unstimulated/cluster DE avg_diff heatmap annotated.png",
+       plot = as.ggplot(DE_cluster_heatmap_annotated),
+       width = 5, height = 7)
+ggsave("results/unstimulated/cluster DE avg_diff heatmap annotated.pdf",
+       plot = as.ggplot(DE_cluster_heatmap_annotated),
+       width = 5, height = 7)
+
+DE_cluster_heatmap_annotated_t <- 
+  plot_data %>% 
+  t() %>% 
+  pheatmap(breaks = seq(-rg, rg, length.out = 100),
+           color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 11, 
+                                                                 name = "RdBu")))(100), 
+           cellwidth = 10, 
+           cellheight = 10)
+
+
+ggsave("results/unstimulated/cluster DE avg_diff heatmap annotated 2.png",
+       plot = as.ggplot(DE_cluster_heatmap_annotated_t),
+       width = 8, height = 7)
+ggsave("results/unstimulated/cluster DE avg_diff heatmap annotated 2.pdf",
+       plot = as.ggplot(DE_cluster_heatmap_annotated_t),
+       width = 8, height = 7)
+
+VlnPlot(pg_data_comb_processed, features = "CD11c", slot = "counts", assay = "RNA")
+VlnPlot(pg_data_comb_processed, features = "CD14", slot = "counts", assay = "RNA")
+VlnPlot(pg_data_comb_processed, features = "CD4", slot = "counts", assay = "RNA")
+VlnPlot(pg_data_comb_processed, features = "CD8", slot = "counts", assay = "RNA")
+VlnPlot(pg_data_comb_processed, features = "CD3E", slot = "counts", assay = "RNA")
+VlnPlot(pg_data_comb_processed, features = "CD45")
+VlnPlot(pg_data_comb_processed, features = "CD161", slot = "counts", assay = "RNA")
+VlnPlot(pg_data_comb_processed, features = c("CD16", "CD161", "CD26", "CD8"))
+
+cell_annotation
+
+```
+
+##### Define identities
+
+Let's save those cell identities. 
+
+```{r}
+
+component_identities <- 
+  pg_data_comb_processed@meta.data %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  select(sample_component, cluster = seurat_clusters) %>% 
+  left_join(cell_annotation,
+            by = "cluster") %>% 
+  separate(sample_component, into = c("sample", "component"), remove = F)
+
+
+component_identities %>% 
+  left_join(meta_data,
+            by = c("sample")) %>% 
+  write_csv("results/unstimulated/cell annotations.csv")
+
+
+component_identities %>% 
+  group_by(sample, cell_type_name) %>% 
+  count() %>%
+  ungroup() %>% 
+  left_join(meta_data) %>% 
+  arrange(-n) %>% 
+  mutate(cell_type_name = factor(cell_type_name, unique(cell_type_name))) %>% 
+  ggplot(aes(cell_type_name, n, group = replicate, fill = cell_type_name)) +
+  geom_col(position = position_dodge(width = 0.95)) +
+  scale_fill_manual(values = cell_palette) +
+  theme_pg() +
+  scale_y_continuous(expand = expansion(c(0, 0.05))) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+ggsave("results/unstimulated/cell type freq.png",
+       width = 6, height = 3)
+
+
+
+component_identities %>% 
+  group_by(sample, cell_type_name) %>% 
+  count() %>%
+  group_by(sample) %>% 
+  mutate(freq = 100* n / sum(n)) %>% 
+  ungroup() %>% 
+  left_join(meta_data) %>% 
+  arrange(n) %>% 
+  mutate(cell_type_name = factor(cell_type_name, 
+                                 rev(c("CD4 T cells",
+                                       "CD8 T cells",
+                                       "MAIT cells",
+                                       "NK cells",
+                                       "B cells",
+                                       "Monocytes")))) %>% 
+  ggplot(aes(freq, replicate, fill = cell_type_name)) +
+  geom_col(show.legend = F) +
+  geom_text(aes(label = paste(round(freq, 1), "%")),
+            position = position_stack(vjust = 0.5),
+            color = "white",
+            angle = -90,
+            size = 2) +
+  scale_fill_manual(values = cell_palette) +
+  theme_pg() +
+  scale_x_continuous(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = "% of cells",
+       y = "Replicate")
+ggsave("results/unstimulated/cell type freq2.png",
+       width = 80, height = 40, units = "mm")
+ggsave("results/unstimulated/cell type freq2.pdf",
+       width = 80, height = 40, units = "mm")
+
+
+component_identities %>% 
+  group_by(cell_type_name) %>% 
+  count() %>%
+  ungroup() %>% 
+  mutate(freq = 100* n / sum(n)) 
+```
+
+
+##### Visualize Differentially abundant markers
+
+Just for our own interest, let's take a look at some of the differentially abundant markers, each cell's abundance projected upon the UMAP.
+
+```{r, fig.width = 6, fig.height = 6}
+
+plot_markers <- 
+  DE_cluster %>% 
+  filter(abs(avg_log2FC) > 2,
+         p_val < 0.01) %>% 
+  pull(gene) %>% 
+  unique()
+
+plot_data <- 
+  umap_data %>% 
+  left_join(pg_data_comb_processed@assays$normalized_clr@counts %>% 
+              as_tibble(rownames = "marker") %>% 
+              gather(sample_component, clr, -1)) %>% 
+  filter(marker %in% c(plot_markers)) %>% 
+  group_by(marker) %>% 
+  mutate(clr_rel = clr / max(clr)) 
+
+plot_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = clr_rel)) +
+  geom_point(size = 0.1) + 
+  facet_wrap(~marker) +
+  scale_color_viridis() +
+  coord_fixed() +
+  theme_umap()
+ggsave("results/unstimulated/UMAP some markers clr.png",
+       width = 8, height = 6)
+
+
+umap_data %>% 
+   left_join(pg_data_comb_processed@assays$RNA@data %>% 
+              as_tibble(rownames = "marker") %>% 
+              gather(sample_component, clr, -1)) %>% 
+  filter(marker %in% c("CD3E", "CD4", "CD8", "CD19", "CD11c", "CD2")) %>% 
+  group_by(marker) %>% 
+  mutate(clr_rel = clr / max(clr)) %>% 
+  
+  ggplot(aes(UMAP_1, UMAP_2, color = clr_rel)) +
+  geom_point(size = 0.1) + 
+  facet_wrap(~marker) +
+  scale_color_viridis(name = "Relative abundance") +
+  coord_fixed() +
+  theme_umap()
+ggsave("results/unstimulated/UMAP some markers clr 2.png",
+       width = 8, height = 6)
+
+ggsave("results/unstimulated/UMAP some markers clr 2.pdf",
+       width = 8, height = 6)
+
+```
+
+
+##### Plot cells with annotation
+
+And here is the UMAP along with annotations. 
+
+```{r}
+umap_data <- 
+  pg_data_comb_processed@reductions$umap@cell.embeddings %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  separate(sample_component, into = c("sample", "component"), remove = F) %>% 
+  left_join(meta_data) %>% 
+  left_join(pg_data_comb_processed@meta.data %>% 
+              as_tibble(rownames = "sample_component")) %>% 
+  mutate(cluster = seurat_clusters) %>% 
+  left_join(cell_annotation)
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = cell_type_name)) +
+  geom_point(size = 1) + 
+  coord_fixed() +
+  theme_umap() +
+  scale_color_manual(values = cell_palette)
+ggsave("results/unstimulated/UMAP cells annotated.png",
+       width = 8, height = 6)
+ggsave("results/unstimulated/UMAP cells annotated.pdf",
+       width = 8, height = 6)
+
+
+
+umap_data %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = cell_type_name)) +
+  geom_mark_ellipse(data = . %>% 
+                   group_by(cell_type_name) %>% 
+                   mutate(centroid_UMAP_1 = median(UMAP_1),
+                          centroid_UMAP_2 = median(UMAP_2), 
+                          dist = sqrt((UMAP_1 - centroid_UMAP_1)^2 +
+                                        (UMAP_2 - centroid_UMAP_2)^2),
+                          distrank = rank(dist) / length(dist)) %>% 
+                   filter(distrank < 0.8),
+                 aes(fill = cell_type_name, 
+                     label = cell_type_name),
+                 color = NA,
+                 # fill = NA,
+                 expand = unit(4, "mm")) +
+  # geom_mark_ellipse(aes(group = seurat_clusters,
+  #                       label = cell_type_name),
+  #                   color = NA,
+  #                   fill = NA,
+  #                   # expand = 0,
+  #                   label.fontsize = 8) +
+  geom_point(size = 1) + 
+  
+  geom_point(data = . %>% 
+               group_by(cell_type_name, seurat_clusters) %>% 
+               summarise(UMAP_1 = median(UMAP_1),
+                         UMAP_2 = median(UMAP_2)),
+             size = 5,
+             alpha = 0.5) +
+  geom_text(data = . %>% 
+              group_by(cell_type_name, seurat_clusters) %>% 
+              summarise(UMAP_1 = median(UMAP_1),
+                        UMAP_2 = median(UMAP_2)),
+            size = 3,
+            aes(label = seurat_clusters), 
+            color = "white") +
+  
+  coord_fixed() +
+  theme_umap() +
+  scale_color_manual(values = cell_palette)  +
+  scale_fill_manual(values = cell_palette) +
+  scale_x_continuous(expand = expansion(c(0.2, 0.2))) +
+  scale_y_continuous(expand = expansion(c(0.2, 0.2))) 
+
+ggsave("results/unstimulated/UMAP cells annotated 2.png",
+       width = 8, height = 6)
+ggsave("results/unstimulated/UMAP cells annotated 2.pdf",
+       width = 8, height = 6)
+
+```
+
+
+## Full data heatmap
+
+Here we just plot a heatmap of the abundance of all measured markers
+
+```{r}
+
+plot_data <- 
+  pg_data_comb_processed@assays$RNA@data[,component_identities$sample_component] %>% 
+  as.matrix() %>% 
+  t() 
+  # sweep(1, apply(., 1, sum), "/") %>% 
+  # `*`(1e4) %>% 
+  # {log10(. + 1)} 
+
+plot_meta <- 
+  component_identities %>% 
+  filter(sample_component %in% rownames(plot_data)) %>% 
+  select(sample_component, sample, cell_type_name) %>% 
+  column_to_rownames("sample_component")
+
+plot_heatmap <- 
+  plot_data %>% 
+  pheatmap(color = inferno(20),
+           border_color = NA,
+           clustering_method = "ward.D2",
+           annotation_row = plot_meta, 
+           annotation_colors = list(cell_type_name = cell_palette),
+           show_rownames = F,
+           cutree_rows = 7,
+           cellwidth = 10,
+           cellheight = 0.65) %>% 
+  as.ggplot()
+ggsave("results/unstimulated/cell abundance heatmap.png",
+       plot = plot_heatmap, 
+       width = 16, height = 12)  
+ggsave("results/unstimulated/cell abundance heatmap.pdf",
+       plot = plot_heatmap,
+       width = 16, height = 12)  
+
+
+
+```
+
+
