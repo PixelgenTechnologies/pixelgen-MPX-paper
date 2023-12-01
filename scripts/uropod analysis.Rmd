@@ -1000,6 +1000,32 @@ ggsave("results/uropod/diff ab i uropod markers full cond CD50.pdf",
        width = 3, height = 4)
 
 
+
+temp_test_data@assays$RNA@data %>%
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, clr, -1) %>% 
+  filter(marker %in% c("CD50")) %>% 
+  separate(sample_component, into = c("sample", "component")) %>% 
+  left_join(meta_data) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  ggplot(aes(full_condition, clr)) +
+  geom_hline(yintercept = 0, 
+             color = "gray") +
+  geom_violin(draw_quantiles = 0.5, 
+              fill = "gray90",
+              scale = "width") +
+  ggbeeswarm::geom_beeswarm(size = 0.1, 
+                            shape = 21,
+                            cex = 0.5,
+                            alpha = 0.5) +
+  stat_compare_means(ref.group = "In solution - Not stimulated", label = "p.signif") +
+  theme_pg() +
+  facet_wrap(~marker, nrow = 3) +
+  scale_y_continuous(expand = expansion(c(0.05, 0.15))) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 60))
+ggsave("results/uropod/diff ab i uropod markers full cond CD50 beeswarm.pdf",
+       width = 5, height = 6)
+
 ```
 
 
@@ -1060,7 +1086,7 @@ if(file.exists("results/uropod/diff polar wilcox res.csv")) {
 
 
 if(file.exists("results/uropod/diff polar wilcox res z.csv")) {
-  polarization_wilcox_res <- read_csv("results/uropod/diff polar wilcox res z.csv")
+  polarization_wilcox_res_z <- read_csv("results/uropod/diff polar wilcox res z.csv")
 } else {
   set.seed(1)
   polarization_wilcox_res_z <-
@@ -1184,6 +1210,26 @@ polarization_scores %>%
 ggsave("results/uropod/diff pol i uropod markers full cond CD50.pdf",
        width = 3, height = 4)
 
+polarization_scores %>% 
+  filter(marker %in% c("CD50")) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  ggplot(aes(full_condition, morans_i)) +
+  geom_hline(yintercept = 0, 
+             color = "gray") +
+  geom_violin(draw_quantiles = 0.5, 
+              fill = "gray90",
+              scale = "width") +
+  ggbeeswarm::geom_beeswarm(size = 0.1, 
+                            shape = 21,
+                            cex = 0.5,
+                            alpha = 0.5) +
+  stat_compare_means(ref.group = "In solution - Not stimulated", label = "p.signif") +
+  theme_pg() +
+  facet_wrap(~marker, nrow = 3) +
+  scale_y_continuous(expand = expansion(c(0.05, 0.15))) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 60))
+ggsave("results/uropod/diff pol i uropod markers full cond CD50 beeswarm.pdf",
+       width = 5, height = 6)
 
 ```
 
@@ -1474,6 +1520,30 @@ temp_test_data %>%
   theme(axis.text.x = element_text(hjust = 1, angle = 60))
 ggsave("results/uropod/diff coloc z uropod markers full cond CD162_50.pdf",
        width = 3, height = 4)
+
+temp_test_data %>% 
+  filter(marker_1 == "CD162",
+         marker_2 == "CD50") %>% 
+  unite(contrast, marker_1, marker_2) %>% 
+  mutate(full_condition = factor(full_condition, condition_plot_order)) %>% 
+  ggplot(aes(full_condition, pearson_z)) +
+  geom_hline(yintercept = 0, 
+             color = "gray") +
+  
+  geom_violin(draw_quantiles = 0.5, 
+              fill = "gray90",
+              scale = "width") +
+  ggbeeswarm::geom_beeswarm(size = 0.1, 
+                            shape = 21,
+                            cex = 0.5,
+                            alpha = 0.5) +
+  stat_compare_means(ref.group = "In solution - Not stimulated", label = "p.signif") +
+  theme_pg() +
+  facet_wrap(~contrast, nrow = 3) +
+  scale_y_continuous(expand = expansion(c(0.05, 0.15))) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 60))
+ggsave("results/uropod/diff coloc z uropod markers full cond CD162_50 beeswarm.pdf",
+       width = 5, height = 6)
 
 
 temp_test_data %>% 
@@ -1809,6 +1879,54 @@ p3_contrast + p2_contrast + p1_contrast
 
 ggsave("results/uropod/localization heatmaps.pdf",
        width = 20, height = 5)
+
+plot_data <- 
+  GetAssayData(pg_data_comb_processed) %>% 
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, clr, -1)%>% 
+  mutate(sample = str_remove(sample_component, "_.*")) %>% 
+  left_join(meta_data) %>% 
+  group_by(marker) %>% 
+  mutate(z_score = (clr - mean(clr)) / sd(clr)) %>% 
+  group_by(full_condition, marker) %>% 
+  summarise(z_score = mean(z_score)) %>% 
+  left_join(DE_condition,
+            by = c("full_condition" = "ident",
+                   "marker")) %>% 
+  filter(marker %in% DE_diff_markers) %>% 
+  ungroup() %>% 
+  add_significance(p.col = "p_val_adj") 
+
+plot_data %>% 
+  ggplot(aes(z_score, avg_log2FC)) +
+  geom_point() +
+  facet_wrap(~full_condition)
+
+plot_data %>% 
+  select(marker, ident = full_condition, z_score, p_val_adj.signif) %>% 
+  cluster_long_data(fill = 0) %>% 
+  mutate(ident = factor(ident, condition_plot_order)) %>% 
+  # cfilter(!complete.cases(.))
+  ggplot(aes(marker, ident, fill = z_score)) +
+  geom_tile() +
+  geom_text(data = . %>% 
+              filter(p_val_adj.signif != "ns"),
+            aes(label = p_val_adj.signif),
+            size = 2) +
+  coord_fixed() +
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       limits = 2 * c(-1, 1)) +
+  scale_x_discrete(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  theme_pg() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        legend.position = "bottom") +
+  labs(y = "Condition",
+       title = "Differentially abundant markers",
+       subtitle = "Compared to Immobilized - unstimulated")
+ggsave("results/uropod/abundance heatmap z_score.pdf",
+       width = 7, height = 5)
+
 ```
 
 ## Abs heatmaps
@@ -2327,5 +2445,134 @@ ggsave("results/uropod/uropod graph fewer examples S3 adj.pdf",
 
 
 
+```
+
+
+
+
+# Uropod marker distance
+
+```{r}
+set.seed(1)
+plot_components <- 
+  pg_data_comb_processed %>% 
+  colnames() %>% 
+  enframe() %>% 
+  mutate(sample = str_remove(value, "_.*")) %>% 
+  filter(sample %in% c("S1", "S3")) %>% 
+  group_by(sample) %>% 
+  filter(value %in% sample(value, 10)) %>% 
+  pull(value)
+  
+
+plot_edgelist <- 
+  edgelists[c("S1", "S3")] %>% 
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component) %>% 
+  filter(sample_component %in% plot_components)
+
+plot_data <- 
+  plot_components %>% 
+  set_names(., .) %>% 
+  pblapply(function(comp) {
+    comp_edgelist <- 
+      plot_edgelist %>% 
+      filter(sample_component == comp) 
+    # Create graph
+    a_graph <- 
+      comp_edgelist %>% 
+      select(upia, upib) %>% 
+      distinct() %>% 
+      as_tbl_graph()
+    
+    # Calculate distances
+    a_graph_distances <- 
+      distances(a_graph)
+    
+    # Select upias
+    uro_upis <- 
+      comp_edgelist %>% 
+      select(marker, upia, umi) %>% 
+      distinct()
+    
+    # Calculate fractions of each distance
+    marker_dists <- 
+      uro_upis %>% 
+      group_by(marker) %>% 
+      do({
+        a_graph_distances[unique(.$upia), unique(.$upia)] %>% 
+          as_tibble(rownames = "upia1") %>% 
+          gather(upia2, dist, -1) %>% 
+          group_by(dist) %>% 
+          count()
+      }) %>% 
+      ungroup() %>% 
+      filter(dist != 0) %>% 
+      group_by(marker) %>% 
+      mutate(frac = n / sum(n))
+    
+    
+    total_dists <- 
+      uro_upis %>% 
+      do({
+        a_graph_distances[unique(.$upia), unique(.$upia)] %>% 
+          as_tibble(rownames = "upia1") %>% 
+          gather(upia2, dist, -1) %>% 
+          group_by(dist) %>% 
+          count()
+      }) %>% 
+      ungroup() %>% 
+      filter(dist != 0) %>% 
+      mutate(frac = n / sum(n))
+    
+    
+    
+    
+    marker_dists %>% 
+      left_join(total_dists,
+                by = "dist",
+                suffix = c("", "_total")) %>% 
+      select(-n, -n_total) %>% 
+      gather(type, frac, contains("frac")) %>% 
+      ungroup()
+    
+  }) %>% 
+  bind_rows(.id = "sample_component")
+
+some_markers <- 
+      c("CD37", "CD50", "CD162",
+        "CD45", "B2M", "HLA-ABC")
+
+plot_data %>% 
+  filter(marker %in% some_markers) %>% 
+  mutate(marker = factor(marker, some_markers)) %>% 
+
+  ggplot(aes(dist, frac, fill = type)) +
+  geom_col(position = position_dodge(),
+           alpha = 0.5) +
+  geom_vline(data = . %>% 
+               group_by(sample_component, marker, type) %>% 
+               summarise(mean = weighted.mean(dist, frac)),
+             aes(xintercept = mean,
+                 color = type),
+             linetype = "dashed") +
+  scale_y_continuous(expand = expansion(c(0, 0.1))) +
+  facet_grid(sample_component ~ marker) +
+  theme_bw() 
+
+plot_data %>% 
+  mutate(sample = str_remove(sample_component, "_.*")) %>% 
+  filter(marker %in% some_markers) %>% 
+  mutate(marker = factor(marker, some_markers)) %>% 
+  group_by(sample, sample_component, marker, type) %>% 
+  summarise(mean = weighted.mean(dist, frac)) %>% 
+  spread(type, mean) %>% 
+  mutate(diff = frac - frac_total) %>% 
+  ggplot(aes(sample, diff, color = sample)) +
+  geom_boxplot() +
+  geom_point() +
+  facet_wrap(~marker) +
+  theme_bw()
+# CD37 - CD50
 ```
 
