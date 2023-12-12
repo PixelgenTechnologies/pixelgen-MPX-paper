@@ -1010,6 +1010,54 @@ ggsave("results/unstimulated/cluster DE avg_diff heatmap.pdf",
        width = 5, height = 10)
 
 
+plot_markers <- 
+  DE_cluster %>% 
+  group_by(gene) %>% 
+  filter(any(p_val_adj < 0.01 & 
+               abs(avg_log2FC) > 2)) %>% 
+  pull(gene) %>% 
+  unique()
+
+plot_data <- 
+  GetAssayData(pg_data_comb_processed) %>% 
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, clr, -1) %>% 
+  left_join(pg_data_comb_processed[[]] %>% 
+              as_tibble(rownames = "sample_component") %>% 
+              select(sample_component, seurat_clusters)) %>% 
+  left_join(cell_annotation,
+            by = c("seurat_clusters" = "cluster")) %>% 
+  group_by(marker) %>% 
+  mutate(z_score = (clr - mean(clr)) / sd(clr)) %>% 
+  group_by(cell_type, marker) %>% 
+  summarise(z_score = mean(z_score)) %>% 
+  filter(marker %in% plot_markers) %>% 
+  spread(marker, z_score) %>% 
+  
+  column_to_rownames("cell_type")
+
+
+rg <- max(abs(plot_data))
+
+
+DE_cluster_heatmap2 <- 
+  plot_data %>% 
+  pheatmap(breaks = seq(-rg, rg, length.out = 100),
+           color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 11, 
+                                                                 name = "RdBu")))(100), 
+           cellwidth = 10, 
+           cellheight = 10)
+
+ggsave("results/unstimulated/cluster DE avg_diff heatmap2.png",
+       plot = as.ggplot(DE_cluster_heatmap2) +
+         theme(plot.background = element_rect(fill = "white", color = NA)),
+       width = 10, height = 5)
+ggsave("results/unstimulated/cluster DE avg_diff heatmap2.pdf",
+       plot = as.ggplot(DE_cluster_heatmap2) +
+         theme(plot.background = element_rect(fill = "white", color = NA)),
+       width = 10, height = 5)
+
+
 DE_cluster %>% 
     group_by(gene) %>% 
     filter(p_val_adj < 0.01 & 
@@ -1312,6 +1360,1445 @@ ggsave("results/unstimulated/UMAP cells annotated 2.pdf",
        width = 8, height = 6)
 
 ```
+
+## Visualization
+
+### Create layouts 
+
+```{r}
+
+
+library(multidplyr)
+
+cluster <- new_cluster(5)
+cluster_library(cluster, 
+                c("dplyr",
+                  "tidyr",
+                  "tibble"))
+cluster_copy(cluster, 
+             c("get_component_layout",
+               "create_node_markers_counts",
+               "edgelist_to_simple_Anode_graph",
+               "edgelist_to_simple_bipart_graph",
+               "map",
+               "write_rds"))
+
+
+
+  
+
+
+edgelists %>%
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component) %>% 
+  group_by(sample_component) %>% 
+  partition(cluster) %>% 
+  do({
+    comp <- .
+    
+    comp_name <- unique(comp$sample_component)
+    
+    component_path <- paste0("data/layouts/unstim_pmds100_3D_", comp_name, ".rds")
+    if(!file.exists(component_path)) {
+      
+      layt <- 
+        comp %>% 
+        get_component_layout(layout_method = "pmds", dim = 3, pivots = 100) 
+      
+      write_rds(layt, component_path)
+    }
+    
+    tibble()
+  }) %>% 
+  collect()
+  
+edgelists %>%
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component) %>% 
+  group_by(sample_component) %>% 
+  partition(cluster) %>% 
+  do({
+    comp <- .
+    
+    comp_name <- unique(comp$sample_component)
+    
+    component_path <- paste0("data/layouts/unstim_pmds100n1_3D_", comp_name, ".rds")
+    if(!file.exists(component_path)) {
+      
+      layt <- 
+        comp %>% 
+        get_component_layout(layout_method = "pmds", dim = 3, k = 1, pivots = 100) 
+      
+      write_rds(layt, component_path)
+    }
+    
+    tibble()
+  }) %>% 
+  collect()
+  
+
+
+edgelists %>%
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component) %>% 
+  group_by(sample_component) %>% 
+  partition(cluster) %>% 
+  do({
+    comp <- .
+    
+    comp_name <- unique(comp$sample_component)
+    
+    component_path <- paste0("data/layouts/unstim_pmds100weighted_3D_", comp_name, ".rds")
+    if(!file.exists(component_path)) {
+      
+      layt <- 
+        comp %>% 
+        get_component_layout(layout_method = "pmds", dim = 3, pivots = 100, weighted = T) 
+      
+      write_rds(layt, component_path)
+    }
+    
+    tibble()
+  }) %>% 
+  collect()
+  
+
+rm(cluster)
+gc()
+
+
+# 
+# component_3Dlayouts_pmds <-
+#   colnames(pg_data_comb_processed) %>%
+#   set_names(., .) %>% # Set names of vector to get named output list
+#   pblapply(function(comp) {
+#     component_path <- paste0("data/layouts/unstim_pmds100_3D_", comp, ".rds")
+#     
+#     layt <- read_rds(component_path)
+#     
+#     layt$graph <- NA
+#     
+#     return(layt)
+#     
+#   })
+
+# 
+# component_3Dlayouts_pmds <-
+#   colnames(pg_data_comb_processed) %>%
+#   set_names(., .) %>% # Set names of vector to get named output list
+#   pblapply(function(comp) {
+#     component_path <- paste0("data/layouts/unstim_pmds100n1_3D_", comp, ".rds")
+# 
+#     layt <- read_rds(component_path)
+# 
+#     layt$graph <- NA
+# 
+#     return(layt)
+# 
+#   })
+
+
+component_3Dlayouts_pmds <-
+  edgelists %>%
+  map(. %>% 
+        select(component) %>% 
+        distinct()) %>% 
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component) %>% 
+  pull(sample_component) %>% 
+  set_names(., .) %>% # Set names of vector to get named output list
+  pblapply(function(comp) {
+    component_path <- paste0("data/layouts/unstim_pmds100weighted_3D_", comp, ".rds")
+
+    layt <- read_rds(component_path)
+
+    layt$graph <- NA
+
+    return(layt)
+
+  })
+```
+
+
+
+### Visualize a few cells
+
+```{r}
+
+
+plot_components <- 
+  c("S1_RCVCMP0000215",
+    "S1_RCVCMP0000231",
+    "S1_RCVCMP0000240",
+    "S1_RCVCMP0000278") 
+
+plot_data <- 
+  component_3Dlayouts_pmds %>% 
+  map(. %>% 
+        {.$layout}) %>% 
+  bind_rows(.id = "sample_component") %>%
+  arrange(z) %>% 
+  left_join(plot_counts)  %>% 
+  
+  filter(sample_component %in% plot_components) %>% 
+  group_by(sample_component, upi, node_type,
+           x, y, z) %>% 
+  summarise(count = sum(count)) %>% 
+  ungroup() %>% 
+  mutate(norm_factor = 
+           select(., x, y, z) %>% 
+           apply(MARGIN = 1, function(x) {
+             as.matrix(x) %>% 
+               norm(type = "F")
+           }),
+         x_norm = x / norm_factor,
+         y_norm = y / norm_factor,
+         z_norm = z / norm_factor) %>% 
+  arrange(z) 
+
+
+plot_data %>% 
+  filter(node_type == "A") %>% 
+  ggplot(aes(x, y,  color = log10(count))) +
+  geom_point() +
+  facet_wrap(~ sample_component) +
+  coord_fixed() +
+  theme_void()
+
+plot_edgelist <- 
+  edgelists$S1 %>% 
+  filter(component %in% str_remove(plot_components, "S1_"))  %>% 
+  select(upia, upib, sample_component = component) %>% 
+  distinct()
+
+plot <- 
+  plot_edgelist %>% 
+  mutate(sample_component = paste0("S1_", sample_component),
+         upia = paste(upia, sample_component),
+         upib = paste(upib, sample_component)) %>% 
+  as_tbl_graph() %>% 
+  mutate(sample_component = str_remove(name, ".* "),
+         upi = str_remove(name, " .*")) %>% 
+  left_join(plot_data) %>% 
+  select(-x, -y) %>% 
+  rename(x = x_norm, y = y_norm) %>% 
+  ggraph(layout = "manual", 
+         x = .$x,
+         y = .$y) +
+  geom_edge_link(color = "gray60",
+                 alpha = 0.3,
+                 width = 0.3) +
+  geom_node_point(alpha = 0.2,
+                  size = 0.3) +
+  facet_wrap(~ sample_component) +
+  coord_fixed() +
+  theme_void()
+ggsave("results/unstimulated/Visualized single examples.png",
+       plot = plot,
+       width = 7, height = 3)
+ggsave("results/unstimulated/Visualized single examples.pdf",
+       plot = plot,
+       width = 7, height = 3)
+
+
+
+plot <- 
+  plot_edgelist %>% 
+  mutate(sample_component = paste0("S1_", sample_component),
+         upia = paste(upia, sample_component),
+         upib = paste(upib, sample_component)) %>% 
+  as_tbl_graph() %>% 
+  mutate(sample_component = str_remove(name, ".* "),
+         upi = str_remove(name, " .*")) %>% 
+  left_join(plot_data) %>% 
+  ggraph(layout = "manual", 
+         x = .$x,
+         y = .$y) +
+  geom_edge_link(color = "gray60",
+                 alpha = 0.3,
+                 width = 0.3) +
+  geom_node_point(alpha = 0.2,
+                  size = 0.3) +
+  facet_wrap(~ sample_component) +
+  coord_fixed() +
+  theme_void()
+ggsave("results/unstimulated/Visualized single examples raw.png",
+       plot = plot,
+       width = 7, height = 3)
+ggsave("results/unstimulated/Visualized single examples raw.pdf",
+       plot = plot,
+       width = 7, height = 3)
+
+
+plot <- 
+  plot_edgelist %>% 
+  mutate(sample_component = paste0("S1_", sample_component),
+         upia = paste(upia, sample_component),
+         upib = paste(upib, sample_component)) %>% 
+  filter(sample_component == "S1_RCVCMP0000240") %>% 
+  distinct() %>% 
+  as_tbl_graph() %>% 
+  mutate(sample_component = str_remove(name, ".* "),
+         upi = str_remove(name, " .*")) %>% 
+  left_join(plot_data) %>% 
+  ggraph(layout = "manual", 
+         x = .$x,
+         y = .$y) +
+  geom_node_point(data = . %>% 
+                    filter(z < 0) %>% 
+                    arrange(z), 
+                  aes(size = z,
+                      color = z),
+                  alpha = 0.8) +
+  geom_edge_link(color = "gray30",
+                 alpha = 0.3,
+                 width = 0.1) +
+  geom_node_point(data = . %>% 
+                    filter(z >= 0) %>% 
+                    arrange(z), 
+                  aes(size = z,
+                      color = z),
+                  alpha = 0.8) +
+  facet_wrap(~ sample_component) +
+  scale_size_continuous(range = c(0.1, 2.5)) +
+  scale_color_gradient(low = "gray10", high = "gray100") +
+  coord_fixed() +
+  theme_void() +
+  theme(panel.background = element_rect(fill = "white"))
+ggsave("results/unstimulated/Visualized single examples raw 240.png",
+       plot = plot,
+       width = 5, height = 5)
+ggsave("results/unstimulated/Visualized single examples raw 240.pdf",
+       plot = plot,
+       width = 5, height = 5)
+
+
+
+```
+
+
+
+## BT doublet detection
+
+```{r}
+colocalization_scores <- 
+  loc_scores %>% 
+  map(. %>% 
+        {.$colocalization}) %>% 
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component, remove = F) %>% 
+  filter(sample_component %in% colnames(pg_data_comb_processed))
+
+polarity_scores <- 
+  loc_scores %>% 
+  map(. %>% 
+        {.$polarization}) %>% 
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component, remove = F) %>% 
+  filter(sample_component %in% colnames(pg_data_comb_processed))
+
+
+
+GetAssayData(pg_data_comb_processed, slot = "data") %>% 
+  t() %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  left_join(colocalization_scores %>% 
+              filter(marker_1 == "CD20", marker_2 == "CD3E"))  %>% 
+  mutate(pearson_z = ifelse(is.na(pearson_z), 0, pearson_z)) %>% 
+  ggplot(aes(CD3E, CD20, size = -pearson_z, color = pearson_z)) +
+  geom_point() +
+  scale_color_gradient2(low = "orangered", mid = "gray90", high = "gray90") +
+  scale_size(range = c(0.5, 3)) +
+  theme_bw() +
+  coord_fixed()
+ggsave("results/unstimulated/CD3 CD20 doublet scatter.png",
+       width = 8, height = 6)
+ggsave("results/unstimulated/CD3 CD20 doublet scatter.pdf",
+       width = 8, height = 6)
+
+GetAssayData(pg_data_comb_processed, slot = "data") %>% 
+  t() %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  left_join(polarity_scores %>% 
+              filter(marker %in% c("CD20", "CD3E")))  %>% 
+  mutate(morans_i = ifelse(is.na(morans_i), 0, morans_i)) %>%
+  ggplot(aes(CD3E, CD20, color = morans_i)) +
+  geom_point() +
+  scale_color_gradient2(low = "gray", mid = "gray90", high = "orangered") +
+  facet_wrap(~marker) +
+  theme_bw() +
+  coord_fixed()
+
+
+
+
+```
+
+### Gate cells
+
+```{r}
+
+
+cell_gates <- 
+  c(CD3E = 0.8,
+    CD19 = 0.45)
+
+
+gate_data <- 
+  GetAssayData(pg_data_comb_processed) %>%
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, clr, -1) %>% 
+  inner_join(cell_gates %>% 
+               enframe("marker", "limit"))
+
+gate_data %>% 
+  ggplot(aes(clr)) +
+  geom_histogram(bins = 50) +
+  geom_vline(data = cell_gates %>% 
+              enframe("marker", "limit"),
+             aes(xintercept = limit),
+             linetype = "dashed") +
+  facet_grid(marker~ . ,
+             scales = "free") +
+  theme_pg()
+ggsave("results/unstimulated/BT gates.png",
+       width = 3, height = 4)
+ggsave("results/unstimulated/BT gates.pdf",
+       width = 3, height = 4)
+
+
+BT_filtered_data <- 
+  pg_data_comb_processed %>% 
+  subset(subset = CD3E > 0.8 | 
+           CD19 > 0.45)
+
+
+some_T_markers <- 
+  c("CD2", "CD3E",
+    "CD5", "CD7")
+some_B_markers <-
+  c("CD40", "CD20", "CD19")
+
+plot_colors <- 
+  RColorBrewer::brewer.pal(5, name = "RdBu") %>% 
+  rev()
+expand_grid(marker_1 = c(some_B_markers, some_T_markers),
+            marker_2 = c(some_B_markers, some_T_markers)) %>% 
+  left_join(GetAssayData(BT_filtered_data, slot = "data") %>% 
+              t() %>% 
+              as_tibble(rownames = "sample_component") %>% 
+              gather(marker, clr, -1),
+            by = c("marker_1" = "marker")) %>% 
+  left_join(GetAssayData(BT_filtered_data, slot = "data") %>% 
+              t() %>% 
+              as_tibble(rownames = "sample_component") %>% 
+              gather(marker, clr, -1),
+            by = c("sample_component", "marker_2" = "marker"),
+            suffix = c("1", "2")) %>% 
+  left_join(colocalization_scores %>% 
+              filter(marker_1 %in% c(some_B_markers, some_T_markers),
+                     marker_2 %in% c(some_B_markers, some_T_markers)) %>% 
+              mutate(temp_marker = ifelse(marker_2 %in% some_T_markers,
+                                          marker_1,
+                                          marker_2),
+                     marker_1 = ifelse(marker_1 %in% some_T_markers,
+                                       marker_1,
+                                       marker_2),
+                     marker_2 = ifelse(marker_2 %in% some_T_markers,
+                                       temp_marker,
+                                       marker_2))) %>% 
+  mutate(pearson_z = ifelse(is.na(pearson_z), 0, pearson_z),
+         pearson_z = ifelse(pearson_z < -40, -40, pearson_z),
+         size = ifelse(pearson_z > 0, 0, -pearson_z),
+         marker_1 = factor(marker_1, some_T_markers),
+         marker_2 = factor(marker_2, some_B_markers)) %>%
+  filter(complete.cases(.)) %>% 
+  ggplot(aes(clr1, clr2, color = pearson_z)) +
+  geom_point(aes(size = size),
+             alpha = 0.8) +
+  scale_color_gradient2(low = plot_colors[1:2], 
+                        mid = "gray90", 
+                        high = plot_colors[4:5],
+                        limits = c(-40, 20),
+                        breaks = c(-40, -20, 0, 20)) +
+  scale_size_continuous(range = c(0.3, 1.5),
+                        limits = c(0, 40),
+                        breaks = c(0, 20, 40)) +
+  facet_grid(marker_2 ~ marker_1, scales = "free") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+ggsave("results/unstimulated/gated BT doublet scatter 2.png",
+       width = 9, height = 6)
+ggsave("results/unstimulated/gated BT doublet scatter 2.pdf",
+       width = 9, height = 6)
+
+plot_data <- 
+  colocalization_scores %>% 
+  filter(sample_component %in% colnames(BT_filtered_data)) %>% 
+  filter(marker_1 %in% c(some_B_markers, some_T_markers),
+         marker_2 %in% c(some_B_markers, some_T_markers)) %>% 
+  mutate(temp_marker = ifelse(marker_2 %in% some_T_markers,
+                              marker_1,
+                              marker_2),
+         marker_1 = ifelse(marker_1 %in% some_T_markers,
+                           marker_1,
+                           marker_2),
+         marker_2 = ifelse(marker_2 %in% some_T_markers,
+                           temp_marker,
+                           marker_2)) %>%
+  filter(marker_1 != marker_2) %>% 
+  unite(contrast, marker_1, marker_2, sep = "/") %>% 
+  select(contrast, sample_component, pearson_z) %>% 
+  mutate(pearson_z = ifelse(pearson_z < -40, -40, pearson_z)) %>%
+  spread(contrast, pearson_z, fill = 0) %>% 
+  column_to_rownames("sample_component") 
+
+plot_legend <- max(abs(range(plot_data)))
+BT_segregation_heatmap <- 
+  plot_data %>% 
+  pheatmap(cutree_rows = 2,
+           color = colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdBu")))(101),
+           breaks = seq(-plot_legend, plot_legend, length.out = 102),
+           cellwidth = 10,
+           show_rownames = F)
+
+ggsave("results/unstimulated/gated BT segregation heatmap.png",
+       plot = as.ggplot(BT_segregation_heatmap),
+       width = 9, height = 9)
+ggsave("results/unstimulated/gated BT segregation heatmap.pdf",
+       plot = as.ggplot(BT_segregation_heatmap),
+       width = 9, height = 9)
+
+
+
+
+
+expand_grid(marker_1 = c(some_T_markers),
+            marker_2 = c(some_B_markers)) %>% 
+  left_join(GetAssayData(BT_filtered_data, slot = "data") %>% 
+              t() %>% 
+              as_tibble(rownames = "sample_component") %>% 
+              gather(marker, clr, -1),
+            by = c("marker_1" = "marker")) %>% 
+  left_join(GetAssayData(BT_filtered_data, slot = "data") %>% 
+              t() %>% 
+              as_tibble(rownames = "sample_component") %>% 
+              gather(marker, clr, -1),
+            by = c("sample_component", "marker_2" = "marker"),
+            suffix = c("1", "2")) %>% 
+  filter(complete.cases(.)) %>% 
+  left_join(BT_segregation_heatmap$tree_row %>% 
+              cutree(2) %>% 
+              enframe("sample_component", "doublet") %>% 
+              mutate(doublet_type = ifelse(doublet == 2,
+                                           "BT doublet", 
+                                           "Not BT doublet"))) %>% 
+  ggplot(aes(clr1, clr2, color = doublet_type)) +
+  geom_point(size = 0.3) +
+  # scale_color_gradient2(low = "skyblue3", mid = "gray90", high = "orangered") +
+  facet_grid(marker_2 ~ marker_1, scales = "free") +
+  theme_bw()
+
+ggsave("results/unstimulated/gated BT doublet scatter class.png",
+       width = 9, height = 4)
+ggsave("results/unstimulated/gated BT doublet scatter class.pdf",
+       width = 9, height = 4)
+
+
+
+pg_data_comb_processed@reductions$umap@cell.embeddings %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  left_join(BT_segregation_heatmap$tree_row %>% 
+              cutree(2) %>% 
+              enframe("sample_component", "doublet") %>% 
+              mutate(doublet_type = ifelse(doublet == 2,
+                                           "BT doublet", 
+                                           "Not BT doublet"))) %>% 
+  ggplot(aes(UMAP_1, UMAP_2, color = doublet_type)) +
+  geom_point() +
+  coord_fixed() +
+  theme_bw()
+
+
+
+plot_data <- 
+  pg_data_comb_processed[[]] %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  select(1, edges, upia) %>% 
+  gather(var, value, -1) %>% 
+  left_join(BT_segregation_heatmap$tree_row %>% 
+              cutree(2) %>% 
+              enframe("sample_component", "doublet") %>% 
+              mutate(doublet_type = ifelse(doublet == 2,
+                                           "BT doublet", 
+                                           "Not BT doublet"))) %>% 
+  filter(!is.na(doublet_type)) 
+
+plot_data %>% 
+  ggplot(aes(doublet_type, value)) +
+  geom_violin(draw_quantiles = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 1,
+                            size = 0.1) +
+  stat_compare_means(method = "wilcox", 
+                     comparisons = list(c("BT doublet", "Not BT doublet"))) +
+  facet_wrap(~ var, scale = "free_y") +
+  scale_y_log10(expand = expansion(c(0, 0.1))) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+
+ggsave("results/unstimulated/gated BT doublet size comparison.png",
+       width = 5, height = 3)
+ggsave("results/unstimulated/gated BT doublet size comparison.pdf",
+       width = 5, height = 3)
+
+plot_data %>% 
+  group_by(doublet_type, var) %>% 
+  summarise(median = median(value)) %>% 
+  spread(doublet_type, median) %>% 
+  mutate(ratio = `BT doublet` / `Not BT doublet`)
+
+
+plot_data <- 
+  expand_grid(marker_1 = c(some_B_markers, some_T_markers),
+              marker_2 = c(some_B_markers, some_T_markers))  %>% 
+  left_join(colocalization_scores %>% 
+              filter(marker_1 %in% c(some_B_markers, some_T_markers),
+                     marker_2 %in% c(some_B_markers, some_T_markers)) %>% 
+              mutate(temp_marker = ifelse(marker_2 %in% some_T_markers,
+                                          marker_1,
+                                          marker_2),
+                     marker_1_orig = marker_1,
+                     marker_2_orig = marker_2,
+                     marker_1 = ifelse(marker_1 %in% some_T_markers,
+                                       marker_1,
+                                       marker_2),
+                     marker_2 = ifelse(marker_2 %in% some_T_markers,
+                                       temp_marker,
+                                       marker_2))) %>% 
+  left_join(BT_segregation_heatmap$tree_row %>% 
+              cutree(2) %>% 
+              enframe("sample_component", "doublet") %>% 
+              mutate(doublet_type = ifelse(doublet == 2,
+                                           "BT doublet", 
+                                           "Not BT doublet"))) %>% 
+  # select(marker_1, marker_2, temp_marker) %>% distinct
+  unite(contrast, marker_1, marker_2, sep = "/", remove = F) %>% 
+  mutate(marker_1 = factor(marker_1, some_T_markers),
+         marker_2 = factor(marker_2, some_B_markers)) %>% 
+  filter(complete.cases(.)) 
+
+plot_data %>% 
+  ggplot(aes(doublet_type, pearson_z)) +
+  geom_violin(draw_quantiles = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 1,
+                            size = 0.1) +
+  facet_grid(marker_2 ~ marker_1) +
+  theme_bw()
+  
+plot_data %>% 
+  group_by(contrast, doublet_type) %>% 
+  summarise(median = median(pearson_z)) %>% 
+  ungroup() %>% 
+  mutate(contrast = factor(contrast, 
+                           filter(., doublet_type == "BT doublet") %>% 
+                             arrange(median) %>% 
+                             pull(contrast))) %>% 
+  ggplot(aes(doublet_type, contrast, fill = median, label = round(median, 1))) +
+  geom_tile() +
+  geom_text(size = 3) +
+  scale_fill_gradient(low = "orangered", high = "gray95") +
+  scale_x_discrete(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  coord_fixed() +
+  theme_bw() +
+  theme(axis.text.x = element_text(hjust = 1, angle = 60))
+
+ggsave("results/unstimulated/gated BT median coloc.png",
+       width = 5, height = 5)
+ggsave("results/unstimulated/gated BT median coloc.pdf",
+       width = 5, height = 5)
+
+```
+
+
+### Visualized
+
+```{r}
+### Generate Kk layouts:
+potential_BT_doublets <- 
+  BT_segregation_heatmap$tree_row %>% 
+  cutree(2) %>% 
+  enframe("sample_component", "doublet") %>%
+  filter(doublet == 2)
+
+potential_BT_doublets %>% 
+  pull(1) %>% 
+  paste(collapse = '",\n"') %>% 
+  paste0('c("', ., '")') %>% 
+  cat()
+
+
+library(multidplyr)
+
+cluster <- new_cluster(5)
+cluster_library(cluster, 
+                c("dplyr",
+                  "tidyr",
+                  "tibble"))
+cluster_copy(cluster, 
+             c("get_component_layout",
+               "create_node_markers_counts",
+               "edgelist_to_simple_Anode_graph",
+               "edgelist_to_simple_bipart_graph",
+               "map",
+               "write_rds"))
+
+edgelists %>%
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component) %>% 
+  filter(sample_component %in% potential_BT_doublets$sample_component) %>% 
+  group_by(sample_component) %>% 
+  partition(cluster) %>% 
+  do({
+    comp <- .
+    
+    comp_name <- unique(comp$sample_component)
+    
+    component_path <- paste0("data/layouts/unstim_kkweighted_3D_", comp_name, ".rds")
+    if(!file.exists(component_path)) {
+      
+      layt <- 
+        comp %>% 
+        get_component_layout(layout_method = "kk", dim = 3, weighted = T) 
+      
+      write_rds(layt, component_path)
+    }
+    
+    tibble()
+  }) %>% 
+  collect()
+
+edgelists %>%
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component) %>% 
+  filter(sample_component %in% potential_BT_doublets$sample_component) %>% 
+  group_by(sample_component) %>% 
+  partition(cluster) %>% 
+  do({
+    comp <- .
+    
+    comp_name <- unique(comp$sample_component)
+    
+    component_path <- paste0("data/layouts/unstim_pmds_3D_", comp_name, ".rds")
+    if(!file.exists(component_path)) {
+      
+      layt <- 
+        comp %>% 
+        get_component_layout(layout_method = "pmds", dim = 3, pivots = 100, weighted = F) 
+      
+      write_rds(layt, component_path)
+    }
+    
+    tibble()
+  }) %>% 
+  collect()
+
+edgelists %>%
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component) %>% 
+  filter(sample_component %in% potential_BT_doublets$sample_component) %>% 
+  group_by(sample_component) %>% 
+  partition(cluster) %>% 
+  do({
+    comp <- .
+    
+    comp_name <- unique(comp$sample_component)
+    
+    component_path <- paste0("data/layouts/unstim_kk_3D_", comp_name, ".rds")
+    if(!file.exists(component_path)) {
+      
+      layt <- 
+        comp %>% 
+        get_component_layout(layout_method = "kk", dim = 3, weighted = F) 
+      
+      write_rds(layt, component_path)
+    }
+    
+    tibble()
+  }) %>% 
+  collect()
+
+rm(cluster)
+
+
+component_3Dlayouts_BT_pmds <-
+  potential_BT_doublets$sample_component %>% 
+  set_names(., .) %>% # Set names of vector to get named output list
+  pblapply(function(comp) {
+    component_path <- paste0("data/layouts/unstim_pmds_3D_", comp, ".rds")
+
+    layt <- read_rds(component_path)
+
+    layt$graph <- NA
+
+    return(layt)
+
+  })
+
+
+plot_counts <- 
+  component_3Dlayouts_BT_pmds %>% 
+  map(. %>% 
+        {.$upi_counts} %>% 
+        as_tibble(rownames = "upi") %>% 
+        gather(marker, count, -1)) %>% 
+  bind_rows(.id = "sample_component") 
+
+plot_comps_data <- 
+  component_3Dlayouts_BT_pmds %>% 
+  map(. %>% 
+        {.$layout}) %>% 
+  bind_rows(.id = "sample_component") %>%
+  filter(node_type == "A") %>% 
+  arrange(z) %>% 
+  left_join(plot_counts) 
+
+plot_comps_data %>% 
+  filter(marker %in% c("CD3E", "CD4", "CD8", "CD45", "CD20", "CD19")) %>% 
+  filter(count > 0) %>% 
+  ggplot(aes(x, y, color = log1p(count))) +
+  geom_point(size = 0.7) +
+  coord_fixed() +
+  facet_grid(marker~ sample_component) +
+  scale_color_gradient(low = "gray80", high = "orangered") +
+  theme_minimal()
+
+
+plot_comps_data %>% 
+  filter(sample_component == names(component_3Dlayouts_BT_pmds)[1]) %>% 
+  mutate(marker = ifelse(marker %in% c("CD20", "CD3E"),
+                         marker,
+                         "Other")) %>% 
+  group_by(marker, upi, x, y, z) %>% 
+  summarise(count = ifelse(marker == "Other", 
+                           0, 
+                           sum(count))) %>% 
+  distinct() %>% 
+  filter(count != 0 | marker == "Other") %>% 
+  group_by(upi) %>% 
+  filter(!(marker == "Other" & any(marker != "Other"))) %>% 
+  arrange(upi) %>% 
+  # filter(count > 0) %>% 
+  plot_ly(x = ~.$x,
+          y = ~.$y,
+          z = ~.$z,
+          color = ~.$marker,
+          size = ~ .$count,
+          sizes = 70*c(1, 10),
+          colors = c("Other" = "gray",
+                     "CD20" = "skyblue",
+                     "CD3E" = "orangered"))
+
+
+# 
+
+
+some_markers <- 
+  c("CD3E", "CD4", "CD8", "CD45", "CD20", "CD19")
+
+
+plot_data <- 
+  plot_comps_data %>% 
+  filter(marker %in% some_markers) %>% 
+  mutate(xbin = cut(x, breaks = seq(-1, 1, length.out = 20)),
+         ybin = cut(y, breaks = seq(-1, 1, length.out = 20))) %>% 
+  group_by(sample_component, xbin, ybin, marker) %>% 
+  summarise(count = sum(count)) %>% 
+  spread(marker, count, fill = 0) %>% 
+  gather(marker, count, -c(1:4)) %>% 
+  ungroup() %>% 
+  mutate(marker = factor(marker, some_markers)) %>% 
+  group_by(sample_component, xbin, ybin) %>% 
+  mutate(total_bincount = sum(count)) 
+
+# plot <- 
+  plot_data %>% 
+  ggplot(aes(xbin, ybin, fill = log10(count + 1), color = log10(count + 1))) +
+  geom_tile() +
+  facet_grid(marker ~ sample_component) +
+  scale_fill_viridis() +
+  scale_color_viridis() +
+  coord_fixed() +
+  theme_void()
+# ggsave("results/unstimulated/Monoplat visualized binned.png",
+#        plot = plot,
+#        width = 45, height = 10)
+# ggsave("results/unstimulated/Monoplat visualized binned.pdf",
+#        plot = plot,
+#        width = 45, height = 10)
+```
+
+
+#### Aligned and normed layouts
+
+```{r}
+
+plot_counts <- 
+  component_3Dlayouts_BT_pmds %>% 
+  map(. %>% 
+        {.$upi_counts} %>% 
+        as_tibble(rownames = "upi") %>% 
+        gather(marker, count, -1)) %>% 
+  bind_rows(.id = "sample_component") 
+
+plot_layouts <- 
+  component_3Dlayouts_BT_pmds %>% 
+  map(. %>% 
+        {.$layout}) %>% 
+  bind_rows(.id = "sample_component") 
+
+# plot_layouts_normcoords <- 
+#   plot_layouts %>% 
+#   select(sample_component, upi, node_type, x, y, z) %>% 
+#   distinct() %>%
+#   mutate(norm_factor = 
+#            select(., x, y, z) %>% 
+#            apply(MARGIN = 1, function(x) {
+#              as.matrix(x) %>% 
+#                norm(type = "F")
+#            }),
+#          x = x / norm_factor,
+#          y = y / norm_factor,
+#          z = z / norm_factor) %>% 
+#   arrange(z) 
+
+procrustes_data <- 
+  plot_layouts %>% 
+  left_join(plot_counts) %>%
+  rename(component = sample_component) %>% 
+  group_split(component) 
+
+procrustes_reference <- 
+  procrustes_data %>% 
+  map(. %>% 
+        select(component) %>% 
+        distinct()) %>% 
+    unlist() %>% 
+    {which(. == "S2_RCVCMP0000094")}
+
+plot_layouts_aligned <- 
+  procrustes_data %>% 
+  procrustes_align(anchor_markers = c("CD45", "HLA-ABC", "B2M",
+                                      "CD20", "CD40", "CD19",
+                                      "CD3E", "CD2", "CD5"), 
+                   reference = procrustes_reference,
+                   do_scale = T) 
+
+
+# some_markers <- 
+#   c("CD45", "HLA-ABC", "B2M",
+#     "CD20", "CD40", "CD19",
+#     "CD3E", "CD2", "CD5",
+#     "CD4", "CD8")
+  
+some_markers <- 
+  c("CD45",
+    "CD20", "CD19",
+    "CD3E", "CD2",
+    "CD4", "CD8")
+
+plot_comps_data <- 
+  plot_layouts_aligned %>% 
+  bind_rows(.id = "sample_component") 
+
+
+plot_comps_data %>% 
+  filter(node_type == "A") %>% 
+  filter(marker %in% some_markers) %>% 
+  mutate(marker = factor(marker, some_markers)) %>% 
+  arrange(-z_rot) %>% 
+  filter(count > 0) %>% 
+  ggplot(aes(x_rot, y_rot, color = log1p(count), size = -z_rot)) +
+  geom_point() +
+  coord_fixed() +
+  facet_grid(sample_component ~ marker) +
+  scale_color_viridis() +
+  scale_size_continuous(range = c(0.3, 2)) +
+  theme_minimal()
+
+
+
+plot_data <-
+  plot_comps_data %>% 
+  filter(node_type == "A") %>% 
+  filter(marker %in% some_markers) %>% 
+  group_by(sample_component) %>% 
+  mutate(x_rot = scales::rescale(x_rot, c(-1, 1)), # Center the component again after alignment
+         y_rot = scales::rescale(y_rot, c(-1, 1))) %>% 
+  mutate(xbin = cut(x_rot, breaks = seq(-1, 1, length.out = 20)),
+         ybin = cut(y_rot, breaks = seq(-1, 1, length.out = 20))) %>% 
+  group_by(sample_component, xbin, ybin, marker) %>% 
+  summarise(count = sum(count)) %>% 
+  spread(marker, count, fill = 0) %>% 
+  gather(marker, count, -c(1:3)) %>% 
+  ungroup() %>% 
+  mutate(marker = factor(marker, some_markers)) %>% 
+  group_by(sample_component, xbin, ybin) %>% 
+  mutate(total_bincount = sum(count)) 
+
+# plot <- 
+#   plot_data %>% 
+#   mutate(sample_component = str_remove(sample_component, "RCVCMP0000")) %>% 
+#   ggplot(aes(xbin, ybin, fill = log10(count + 1), color = log10(count + 1))) +
+#   geom_tile() +
+#   facet_grid(marker ~ sample_component) +
+#   scale_fill_viridis() +
+#   scale_color_viridis() +
+#   coord_fixed() +
+#   theme_void()
+# ggsave("results/unstimulated/BT visualized aligned binned.png",
+#        plot = plot,
+#        width = 45, height = 10)
+# ggsave("results/unstimulated/BT visualized aligned binned.pdf",
+#        plot = plot,
+#        width = 45, height = 10)
+
+# plot <- 
+plot_data %>% 
+  mutate(sample_component = str_remove(sample_component, "RCVCMP0000")) %>% 
+  group_by(sample_component) %>% 
+  mutate(count = log10(count + 1), 
+         color = count / max(c(count, 1))) %>% 
+  ggplot(aes(xbin, ybin, fill = color, color = color)) +
+  geom_tile() +
+  facet_grid(marker ~ sample_component) +
+  scale_fill_gradientn(colours = ggsci::pal_material(palette = "blue-grey")(10))+#c("gray95", "mistyrose", "red", "darkred")) +
+  scale_color_gradientn(colours = ggsci::pal_material(palette = "blue-grey")(10)) + #c("gray95", "mistyrose", "red", "darkred")) +
+  coord_fixed() +
+  theme_void()
+ggsave("results/unstimulated/BT visualized aligned binned examples.png",
+       width = 10, height = 10)
+ggsave("results/unstimulated/BT visualized aligned binned examples.pdf",
+       width = 10, height = 10)
+
+
+```
+
+
+#### Visualise BT doublets
+
+```{r}
+
+
+plot_data <-
+  plot_comps_data %>% 
+  filter(node_type == "A") %>% 
+  filter(marker %in% some_markers) %>% 
+  group_by(sample_component) %>% 
+  mutate(x_rot = scales::rescale(x_rot, c(-1, 1)), # Center the component again after alignment
+         y_rot = scales::rescale(y_rot, c(-1, 1))) %>% 
+  mutate(xbin = cut(x_rot, breaks = seq(-1, 1, length.out = 20)),
+         ybin = cut(y_rot, breaks = seq(-1, 1, length.out = 20))) %>% 
+  group_by(sample_component, xbin, ybin, marker) %>% 
+  summarise(count = sum(count)) %>% 
+  spread(marker, count, fill = 0) %>% 
+  gather(marker, count, -c(1:3)) %>% 
+  ungroup() %>% 
+  mutate(marker = factor(marker, some_markers)) %>% 
+  group_by(sample_component, xbin, ybin) %>% 
+  mutate(total_bincount = sum(count)) 
+
+
+
+plot_comps_data %>% 
+  filter(node_type == "A") %>% 
+  filter(marker %in% c(some_B_markers,
+                       some_T_markers)) %>%
+  mutate(marker = ifelse(marker %in% some_B_markers,
+                         "B cell", 
+                         "T cell")) %>% 
+  group_by(sample_component, component, upi, marker, 
+           x_rot, y_rot, z_rot) %>% 
+  summarise(count = sum(count)) %>% 
+  ungroup() %>% 
+  mutate(count = log10(count + 1)) %>% 
+  spread(marker, count) %>% 
+  # filter(sample_component %in% unique(sample_component)[1:6]) %>%
+  group_by(sample_component) %>% 
+  mutate(`B cell` = `B cell` / max(`B cell`),
+         `T cell` = `T cell` / max(`T cell`)) %>% 
+  mutate(color = 
+           rgb(red = `B cell`,
+               green = `T cell`, 
+               blue = (`B cell`+`T cell`)/5, 
+               maxColorValue = 1)) %>% 
+  arrange(z_rot) %>% 
+  ggplot(aes(x_rot, y_rot, color = color, 
+             size = `B cell` + `T cell`)) +
+  geom_point(alpha = 0.75) +
+  # scale_color_gradient2(low = "#236F9A", mid = "gray", high = "#E52100")
+  facet_wrap(~sample_component) +
+  scale_color_identity() +
+  scale_size_continuous(range = c(0.1, 4)) +
+  coord_fixed() +
+  theme_void()
+
+expand_grid(x = seq(0, 1, length.out = 50),
+            y = seq(0, 1, length.out = 50)) %>% 
+  mutate(color = 
+           rgb(red = y,
+               green = x, 
+               blue = (y+x)/4,
+               maxColorValue = 1)) %>% 
+  ggplot(aes(x, y, fill = color, color = color)) +
+  geom_tile() +
+  scale_fill_identity() +
+  scale_color_identity() +
+  coord_fixed() +
+  theme_void()
+
+
+
+#####
+
+
+plot_edgelist <- 
+  edgelists %>% 
+  map(. %>% 
+        filter(component %in% str_remove(potential_BT_doublets$sample_component, ".*_")))  %>% 
+  bind_rows(.id = "sample") %>% 
+  unite(sample_component, sample, component) %>% 
+  filter(sample_component %in% potential_BT_doublets$sample_component) %>% 
+  select(upia, upib, sample_component) %>% 
+  distinct()
+
+plot_coloring <-
+  plot_comps_data %>% 
+  filter(node_type == "A") %>% 
+  filter(marker %in% c(some_B_markers,
+                       some_T_markers)) %>%
+  mutate(marker = ifelse(marker %in% some_B_markers,
+                         "B cell", 
+                         "T cell")) %>% 
+  group_by(sample_component, component, upi, marker) %>% 
+  summarise(count = sum(count)) %>% 
+  ungroup() %>% 
+  mutate(count = log10(count + 1)) %>% 
+  
+  spread(marker, count) %>% 
+  # filter(sample_component %in% unique(sample_component)[1:6]) %>%
+  group_by(sample_component) %>% 
+  mutate(`B cell` = `B cell` / max(`B cell`),
+         `T cell` = `T cell` / max(`T cell`)) %>% 
+  mutate(color = 
+           rgb(red = `B cell`,
+               green = `T cell`, 
+               blue = (`B cell`+`T cell`)/5, 
+               maxColorValue = 1)) 
+
+plot_coords <-
+  plot_comps_data %>% 
+  select(sample_component, upi, node_type, 
+         x_rot, y_rot, z_rot) %>% 
+  distinct()
+
+plot <-
+  plot_edgelist %>% 
+  mutate(upia = paste(upia, sample_component),
+         upib = paste(upib, sample_component)) %>% 
+  distinct() %>% 
+  # filter(sample_component == sample_component[1]) %>%
+  as_tbl_graph(directed = F) %>% 
+  mutate(sample_component = str_remove(name, ".* "),
+         upi = str_remove(name, " .*")) %>% 
+  left_join(plot_coloring) %>% 
+  left_join(plot_coords) %>%
+  rename(x = x_rot,
+         y = y_rot,
+         z = z_rot) %>%
+  mutate(size = case_when(z < -1 ~ -1,
+                          z > 1 ~ 1,
+                          T ~ z)) %>% 
+  ggraph(layout = "manual", 
+         x = as_tibble(.)$x,
+         y = as_tibble(.)$y) +
+  geom_node_point(data = . %>%
+                    filter(z < 0) %>%
+                    arrange(z),
+                  aes(size = z,
+                      color = color,
+                      alpha = `B cell` + `T cell` > 0)) +
+  geom_edge_link(color = "gray30",
+                 alpha = 0.3,
+                 width = 0.1) +
+  geom_node_point(data = . %>% 
+                    filter(z >= 0) %>% 
+                    arrange(z), 
+                  aes(size = z,
+                      color = color,
+                      alpha = `B cell` + `T cell` > 0)) +
+  facet_wrap(~ sample_component) +
+  scale_size_continuous(range = c(0.5, 4)) +
+  scale_color_identity() +
+  scale_alpha_manual(values = c("TRUE" = 0.8, "FALSE" = 0.1)) +
+  coord_fixed() +
+  theme_void() +
+  theme(panel.background = element_rect(fill = "white"))
+ggsave("results/unstimulated/BT doublet visualized.png",
+       plot = plot,
+       width = 24, height = 24)
+ggsave("results/unstimulated/BT doublet visualized.pdf",
+       plot = plot,
+       width = 24, height = 24)
+
+
+
+plot <-
+  plot_edgelist %>% 
+  mutate(upia = paste(upia, sample_component),
+         upib = paste(upib, sample_component)) %>% 
+  distinct() %>% 
+  filter(sample_component %in% c("S1_RCVCMP0000578",
+                                 "S2_RCVCMP0000030",
+                                 "S2_RCVCMP0000108",
+                                 "S2_RCVCMP0000104")) %>%
+  as_tbl_graph(directed = F) %>% 
+  mutate(sample_component = str_remove(name, ".* "),
+         upi = str_remove(name, " .*")) %>% 
+  left_join(plot_coloring) %>% 
+  left_join(plot_coords) %>%
+  rename(x = x_rot,
+         y = y_rot,
+         z = z_rot) %>%
+  mutate(size = case_when(z < -1 ~ -1,
+                          z > 1 ~ 1,
+                          T ~ z)) %>% 
+  ggraph(layout = "manual", 
+         x = as_tibble(.)$x,
+         y = as_tibble(.)$y) +
+  geom_node_point(data = . %>%
+                    filter(z < 0) %>%
+                    arrange(z),
+                  aes(size = size,
+                      color = color,
+                      alpha = `B cell` + `T cell` > 0)) +
+  geom_edge_link(color = "gray30",
+                 alpha = 0.3,
+                 width = 0.1) +
+  geom_node_point(data = . %>% 
+                    filter(z >= 0) %>% 
+                    arrange(z), 
+                  aes(size = size,
+                      color = color,
+                      alpha = `B cell` + `T cell` > 0)) +
+  facet_wrap(~ sample_component) +
+  scale_size_continuous(range = c(0.5, 4)) +
+  scale_color_identity() +
+  scale_alpha_manual(values = c("TRUE" = 0.8, "FALSE" = 0.1)) +
+  coord_fixed() +
+  theme_void() +
+  theme(panel.background = element_rect(fill = "white"))
+ggsave("results/unstimulated/BT doublet visualized few.png",
+       plot = plot,
+       width = 12, height = 12)
+ggsave("results/unstimulated/BT doublet visualized few.pdf",
+       plot = plot,
+       width = 12, height = 12)
+
+
+
+expand_grid(x = seq(0, 1, length.out = 50),
+            y = seq(0, 1, length.out = 50)) %>% 
+  mutate(color = 
+           rgb(red = y,
+               green = x, 
+               blue = (y+x)/5,
+               maxColorValue = 1)) %>% 
+  ggplot(aes(x, y, fill = color, color = color)) +
+  geom_tile() +
+  scale_fill_identity() +
+  scale_color_identity() +
+  scale_x_continuous(breaks = 0:1, expand = expansion(0)) +
+  scale_y_continuous(breaks = 0:1, expand = expansion(0)) +
+  coord_fixed() +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        panel.border = element_blank())
+ggsave("results/unstimulated/BT doublet legend.png",
+       width = 2, height = 2)
+ggsave("results/unstimulated/BT doublet legend.pdf",
+       width = 2, height = 2)
+
+```
+
+
+#### 2D density
+
+```{r}
+# 2D Density plots
+
+plot_data_density <- 
+  plot_comps_data %>% 
+  filter(count > 0) %>%
+  group_by_all() %>% 
+  summarise(i = rep(1, count)) %>% 
+  group_by(sample_component, marker) %>% 
+  do({
+    get_density(.$y_rot, .$x_rot, h = 0.3, n = 40)
+  }) 
+
+
+plot_data_density_null <- 
+  plot_comps_data %>% 
+  group_by(sample_component, upi, x_rot, y_rot) %>% 
+  summarise(count = sum(count)) %>% 
+  group_by(sample_component) %>% 
+  do({
+    get_density(.$y_rot, .$x_rot, h = 0.3, n = 40)
+  }) 
+
+
+
+
+plot_data <- 
+  plot_data_density %>% 
+  filter(marker %in% some_markers) %>% 
+  mutate(marker = factor(marker, c(some_markers))) 
+
+# plot_hulls <- 
+#   plot_data_density_null %>% 
+#   filter(sample_component %in% plot_data$sample_component) %>% 
+#   group_by(sample_component) %>% 
+#   mutate(normalized_density = density / sum(density)) %>% 
+#   arrange(-normalized_density) %>% 
+#   mutate(cum_density = cumsum(normalized_density)) %>% 
+#   filter(cum_density <= 0.99) %>% 
+#   group_by(sample_component) %>%
+#   do({select(., x, y) %>% 
+#       as.matrix() %>% 
+#       concaveman::concaveman(concavity = 2) %>% 
+#       as_tibble() %>% 
+#       rename(x = V1, 
+#              y = V2)}) %>% 
+#   ungroup() %>% 
+#   left_join(PMA_category)
+
+
+
+plot_data%>% 
+  group_by(sample_component, marker) %>% 
+  # mutate(density = scales::rescale(density, 0:1)) %>% 
+  ggplot(aes(x, y, fill = density)) +
+  geom_tile() +
+  # geom_polygon(data = plot_hulls,
+  #              aes(x, y),
+  #              inherit.aes = F,
+  #              color = "white",
+  #              alpha = 0.1) +
+  facet_grid(marker ~ sample_component) +
+  scale_fill_viridis() +
+  coord_fixed() +
+  theme_void()
+
+plot_data %>% 
+  left_join(plot_data_density_null,
+            by = c("sample_component", "x", "y"), 
+            suffix = c("", "_null")) %>% 
+  filter(marker == "CD3E", 
+         sample_component == "S2_RCVCMP0000094") %>% 
+  ggplot(aes(density, density_null)) +
+  geom_point()
+
+plot_data %>% 
+  left_join(plot_data_density_null,
+            by = c("sample_component", "x", "y"), 
+            suffix = c("", "_null")) %>% 
+  mutate(marker = factor(marker, c(some_markers))) %>%
+  group_by(sample_component, marker) %>% 
+  mutate(density_diff = density - density_null,
+         normalized_density_diff = density_diff / max(abs(density_diff))) %>% 
+  ungroup() %>% 
+  ggplot(aes(x, y, fill = normalized_density_diff)) +
+  geom_tile() +
+  facet_grid(marker ~ sample_component) +
+  scale_fill_gradient2(high = "red", mid = "black", low = "green") +
+  coord_fixed() +
+  theme_void()
+
+
+
+plot_data %>% 
+  select(-count) %>% 
+  group_by(sample_component, marker) %>% 
+  mutate(density = density / sum(density)) %>% 
+
+  spread(marker, density) %>% 
+  ggplot(aes(x, y, fill = CD3E - CD20)) +
+  geom_tile() +
+  facet_grid( ~ sample_component) +
+  scale_fill_gradient2(high = "red", mid = "black", low = "green") +
+  coord_fixed() +
+  theme_void()
+
+
+plot_data %>% 
+  select(-count) %>% 
+  left_join(plot_data_density_null,
+            by = c("sample_component", "x", "y"), 
+            suffix = c("", "_null")) %>% 
+  group_by(sample_component, marker) %>% 
+  mutate(density = density / sum(density),
+         density_null = density_null / sum(density_null),
+         # density = density - density_null,
+         # density = ifelse(density < 0, 0, density),
+         density = scales::rescale(density, 0:1)
+         ) %>% 
+
+  spread(marker, density) %>% 
+  mutate(color = 
+           rgb(red = CD3E,
+               green = CD20, 
+               blue = 0,
+               maxColorValue = max(c(CD3E, CD20)))) %>% 
+  ggplot(aes(x, y, fill = color)) +
+  geom_tile() +
+  facet_grid( ~ sample_component) +
+  scale_fill_identity() +
+  coord_fixed() +
+  theme_void()
+
+
+plot_data%>% 
+  group_by(sample_component, marker) %>%
+  mutate(density = scales::rescale(count*density, 0:1)) %>%
+  select(-count) %>% 
+  spread(marker, density, fill = 0) %>% 
+  mutate(sample_component = str_remove(sample_component, "RCVCMP000"))  %>% 
+  ggplot(aes(x, y, fill = CD3E - CD20)) +
+  geom_tile() +
+  # geom_polygon(data = plot_hulls,
+  #              aes(x, y),
+  #              inherit.aes = F,
+  #              color = "white",
+  #              alpha = 0.1) +
+  facet_grid( ~ sample_component) +
+  # scale_fill_viridis() +
+  scale_fill_gradient2(high = "orangered3", mid = "white", low = "skyblue3") +
+  coord_fixed() +
+  theme_void()
+
+####################################
+
+
+
+
+plot_data
+
+
+
+```
+
 
 
 ## Full data heatmap
