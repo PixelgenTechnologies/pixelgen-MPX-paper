@@ -393,6 +393,10 @@ ggsave("results/unstimulated/metrics of called cells distribution.png",
 ggsave("results/unstimulated/metrics of called cells distribution.pdf",
        width = 10, height = 7)
 
+plot_data %>% 
+  write_csv("results/unstimulated/extended figure 1 source data.csv")
+
+
 ```
 
 
@@ -1010,54 +1014,6 @@ ggsave("results/unstimulated/cluster DE avg_diff heatmap.pdf",
        width = 5, height = 10)
 
 
-plot_markers <- 
-  DE_cluster %>% 
-  group_by(gene) %>% 
-  filter(any(p_val_adj < 0.01 & 
-               abs(avg_log2FC) > 2)) %>% 
-  pull(gene) %>% 
-  unique()
-
-plot_data <- 
-  GetAssayData(pg_data_comb_processed) %>% 
-  as_tibble(rownames = "marker") %>% 
-  gather(sample_component, clr, -1) %>% 
-  left_join(pg_data_comb_processed[[]] %>% 
-              as_tibble(rownames = "sample_component") %>% 
-              select(sample_component, seurat_clusters)) %>% 
-  left_join(cell_annotation,
-            by = c("seurat_clusters" = "cluster")) %>% 
-  group_by(marker) %>% 
-  mutate(z_score = (clr - mean(clr)) / sd(clr)) %>% 
-  group_by(cell_type, marker) %>% 
-  summarise(z_score = mean(z_score)) %>% 
-  filter(marker %in% plot_markers) %>% 
-  spread(marker, z_score) %>% 
-  
-  column_to_rownames("cell_type")
-
-
-rg <- max(abs(plot_data))
-
-
-DE_cluster_heatmap2 <- 
-  plot_data %>% 
-  pheatmap(breaks = seq(-rg, rg, length.out = 100),
-           color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 11, 
-                                                                 name = "RdBu")))(100), 
-           cellwidth = 10, 
-           cellheight = 10)
-
-ggsave("results/unstimulated/cluster DE avg_diff heatmap2.png",
-       plot = as.ggplot(DE_cluster_heatmap2) +
-         theme(plot.background = element_rect(fill = "white", color = NA)),
-       width = 10, height = 5)
-ggsave("results/unstimulated/cluster DE avg_diff heatmap2.pdf",
-       plot = as.ggplot(DE_cluster_heatmap2) +
-         theme(plot.background = element_rect(fill = "white", color = NA)),
-       width = 10, height = 5)
-
-
 DE_cluster %>% 
     group_by(gene) %>% 
     filter(p_val_adj < 0.01 & 
@@ -1113,6 +1069,59 @@ ggsave("results/unstimulated/cluster DE avg_diff heatmap annotated.png",
 ggsave("results/unstimulated/cluster DE avg_diff heatmap annotated.pdf",
        plot = as.ggplot(DE_cluster_heatmap_annotated),
        width = 5, height = 7)
+
+
+plot_markers <- 
+  DE_cluster %>% 
+  group_by(gene) %>% 
+  filter(any(p_val_adj < 0.01 & 
+               abs(avg_log2FC) > 2)) %>% 
+  pull(gene) %>% 
+  unique()
+
+plot_data <- 
+  GetAssayData(pg_data_comb_processed) %>% 
+  as_tibble(rownames = "marker") %>% 
+  gather(sample_component, clr, -1) %>% 
+  left_join(pg_data_comb_processed[[]] %>% 
+              as_tibble(rownames = "sample_component") %>% 
+              select(sample_component, seurat_clusters)) %>% 
+  left_join(cell_annotation,
+            by = c("seurat_clusters" = "cluster")) %>% 
+  group_by(marker) %>% 
+  mutate(z_score = (clr - mean(clr)) / sd(clr)) %>% 
+  group_by(cell_type, marker) %>% 
+  summarise(z_score = mean(z_score)) %>% 
+  filter(marker %in% plot_markers) %>% 
+  spread(marker, z_score) %>% 
+  
+  column_to_rownames("cell_type")
+
+
+rg <- max(abs(plot_data))
+
+plot_data %>% 
+  as_tibble(rownames = "cluster") %>% 
+  write_csv("results/unstimulated/fig2B source data.csv")
+
+DE_cluster_heatmap2 <- 
+  plot_data %>% 
+  pheatmap(breaks = seq(-rg, rg, length.out = 100),
+           color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 11, 
+                                                                 name = "RdBu")))(100), 
+           cellwidth = 10, 
+           cellheight = 10)
+
+ggsave("results/unstimulated/cluster DE avg_diff heatmap2.png",
+       plot = as.ggplot(DE_cluster_heatmap2) +
+         theme(plot.background = element_rect(fill = "white", color = NA)),
+       width = 10, height = 5)
+ggsave("results/unstimulated/cluster DE avg_diff heatmap2.pdf",
+       plot = as.ggplot(DE_cluster_heatmap2) +
+         theme(plot.background = element_rect(fill = "white", color = NA)),
+       width = 10, height = 5)
+
+
 
 DE_cluster_heatmap_annotated_t <- 
   plot_data %>% 
@@ -1182,8 +1191,8 @@ ggsave("results/unstimulated/cell type freq.png",
        width = 6, height = 3)
 
 
-
-component_identities %>% 
+plot_data <- 
+  component_identities %>% 
   group_by(sample, cell_type_name) %>% 
   count() %>%
   group_by(sample) %>% 
@@ -1197,7 +1206,12 @@ component_identities %>%
                                        "MAIT cells",
                                        "NK cells",
                                        "B cells",
-                                       "Monocytes")))) %>% 
+                                       "Monocytes")))) 
+plot_data %>% 
+  arrange(cell_type_name, sample) %>% 
+  write_csv("results/unstimulated/fig2C source data.csv")
+
+plot_data %>% 
   ggplot(aes(freq, replicate, fill = cell_type_name)) +
   geom_col(show.legend = F) +
   geom_text(aes(label = paste(round(freq, 1), "%")),
@@ -1258,14 +1272,20 @@ plot_data %>%
 ggsave("results/unstimulated/UMAP some markers clr.png",
        width = 8, height = 6)
 
-
-umap_data %>% 
+plot_data <- 
+  umap_data %>% 
    left_join(pg_data_comb_processed@assays$RNA@data %>% 
               as_tibble(rownames = "marker") %>% 
               gather(sample_component, clr, -1)) %>% 
   filter(marker %in% c("CD3E", "CD4", "CD8", "CD19", "CD11c", "CD2")) %>% 
   group_by(marker) %>% 
-  mutate(clr_rel = clr / max(clr)) %>% 
+  mutate(clr_rel = clr / max(clr)) 
+
+plot_data %>% 
+  write_csv("results/unstimulated/fig2D source data.csv")
+
+
+plot_data %>% 
   
   ggplot(aes(UMAP_1, UMAP_2, color = clr_rel)) +
   geom_point(size = 0.1) + 
@@ -1296,6 +1316,10 @@ umap_data <-
               as_tibble(rownames = "sample_component")) %>% 
   mutate(cluster = seurat_clusters) %>% 
   left_join(cell_annotation)
+
+umap_data %>% 
+  write_csv("results/unstimulated/fig2A source data.csv")
+
 
 umap_data %>% 
   ggplot(aes(UMAP_1, UMAP_2, color = cell_type_name)) +
@@ -1782,8 +1806,10 @@ some_B_markers <-
 plot_colors <- 
   RColorBrewer::brewer.pal(5, name = "RdBu") %>% 
   rev()
-expand_grid(marker_1 = c(some_B_markers, some_T_markers),
-            marker_2 = c(some_B_markers, some_T_markers)) %>% 
+
+plot_data <- 
+  expand_grid(marker_1 = c(some_B_markers, some_T_markers),
+              marker_2 = c(some_B_markers, some_T_markers)) %>% 
   left_join(GetAssayData(BT_filtered_data, slot = "data") %>% 
               t() %>% 
               as_tibble(rownames = "sample_component") %>% 
@@ -1812,7 +1838,9 @@ expand_grid(marker_1 = c(some_B_markers, some_T_markers),
          size = ifelse(pearson_z > 0, 0, -pearson_z),
          marker_1 = factor(marker_1, some_T_markers),
          marker_2 = factor(marker_2, some_B_markers)) %>%
-  filter(complete.cases(.)) %>% 
+  filter(complete.cases(.)) 
+
+plot_data %>% 
   ggplot(aes(clr1, clr2, color = pearson_z)) +
   geom_point(aes(size = size),
              alpha = 0.8) +
@@ -1831,6 +1859,9 @@ ggsave("results/unstimulated/gated BT doublet scatter 2.png",
        width = 9, height = 6)
 ggsave("results/unstimulated/gated BT doublet scatter 2.pdf",
        width = 9, height = 6)
+
+plot_data %>% 
+  write_csv("results/unstimulated/extended fig4A source data.csv")
 
 plot_data <- 
   colocalization_scores %>% 
@@ -1869,6 +1900,9 @@ ggsave("results/unstimulated/gated BT segregation heatmap.pdf",
        plot = as.ggplot(BT_segregation_heatmap),
        width = 9, height = 9)
 
+plot_data %>% 
+  as_tibble(rownames = "sample_component") %>% 
+  write_csv("results/unstimulated/extended fig4B source data.csv")
 
 
 
@@ -1953,6 +1987,10 @@ ggsave("results/unstimulated/gated BT doublet size comparison.pdf",
        width = 5, height = 3)
 
 plot_data %>% 
+  write_csv("results/unstimulated/extended fig4DE source data.csv")
+
+
+plot_data %>% 
   group_by(doublet_type, var) %>% 
   summarise(median = median(value)) %>% 
   spread(doublet_type, median) %>% 
@@ -1996,14 +2034,17 @@ plot_data %>%
   facet_grid(marker_2 ~ marker_1) +
   theme_bw()
   
-plot_data %>% 
+plot_data <- 
+  plot_data %>% 
   group_by(contrast, doublet_type) %>% 
   summarise(median = median(pearson_z)) %>% 
   ungroup() %>% 
   mutate(contrast = factor(contrast, 
                            filter(., doublet_type == "BT doublet") %>% 
                              arrange(median) %>% 
-                             pull(contrast))) %>% 
+                             pull(contrast))) 
+
+plot_data %>% 
   ggplot(aes(doublet_type, contrast, fill = median, label = round(median, 1))) +
   geom_tile() +
   geom_text(size = 3) +
@@ -2018,6 +2059,10 @@ ggsave("results/unstimulated/gated BT median coloc.png",
        width = 5, height = 5)
 ggsave("results/unstimulated/gated BT median coloc.pdf",
        width = 5, height = 5)
+
+plot_data %>% 
+  write_csv("results/unstimulated/extended fig4C source data.csv")
+
 
 ```
 
@@ -2554,7 +2599,7 @@ ggsave("results/unstimulated/BT doublet visualized.pdf",
 
 
 
-plot <-
+plot_data <-
   plot_edgelist %>% 
   mutate(upia = paste(upia, sample_component),
          upib = paste(upib, sample_component)) %>% 
@@ -2573,7 +2618,10 @@ plot <-
          z = z_rot) %>%
   mutate(size = case_when(z < -1 ~ -1,
                           z > 1 ~ 1,
-                          T ~ z)) %>% 
+                          T ~ z)) 
+
+plot <- 
+  plot_data %>% 
   ggraph(layout = "manual", 
          x = as_tibble(.)$x,
          y = as_tibble(.)$y) +
@@ -2606,6 +2654,14 @@ ggsave("results/unstimulated/BT doublet visualized few.pdf",
        plot = plot,
        width = 12, height = 12)
 
+plot_data %>% 
+  as_tibble() %>% 
+  write_csv("results/unstimulated/extended fig4F source data 1.csv")
+
+plot_data %>% 
+  activate(edges) %>% 
+  as_tibble() %>% 
+  write_csv("results/unstimulated/extended fig4F source data 2.csv")
 
 
 expand_grid(x = seq(0, 1, length.out = 50),
@@ -2839,6 +2895,7 @@ ggsave("results/unstimulated/cell abundance heatmap.png",
 ggsave("results/unstimulated/cell abundance heatmap.pdf",
        plot = plot_heatmap,
        width = 16, height = 12)  
+
 
 
 

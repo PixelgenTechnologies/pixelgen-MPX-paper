@@ -550,6 +550,9 @@ ggsave("results/doublet/Doublet scatters.png",
 ggsave("results/doublet/Doublet scatters.pdf",
        width = 5, height = 4)
 
+marker_combo_data %>% 
+  write_csv("results/doublet/Extended data figure 2A source.csv")
+
 ```
 
 
@@ -723,9 +726,9 @@ FeaturePlot(pg_data_comb_processed,
             dims = c(1,2))
 
 
-
-pca_data %>% 
-   left_join(pg_data_comb_processed@assays$RNA@data %>% 
+plot_data <- 
+  pca_data %>% 
+  left_join(pg_data_comb_processed@assays$RNA@data %>% 
               as_tibble(rownames = "marker") %>% 
               gather(sample_component, clr, -1)) %>% 
   filter(marker %in% c("CD2", 
@@ -733,7 +736,9 @@ pca_data %>%
                        "CD19",
                        "CD20")) %>% 
   group_by(marker) %>% 
-  mutate(clr_rel = clr / max(clr)) %>% 
+  mutate(clr_rel = clr / max(clr)) 
+
+plot_data %>% 
   
   ggplot(aes(PC_1, PC_2, color = clr_rel)) +
   geom_point(size = 1) + 
@@ -746,6 +751,10 @@ ggsave("results/doublet/UMAP some markers clr.png",
 
 ggsave("results/doublet/UMAP some markers clr.pdf",
        width = 6, height = 4)
+
+plot_data %>% 
+  write_csv("results/doublet/Extended data figure 2B source.csv")
+
 
 ```
 
@@ -810,7 +819,7 @@ plot_data %>%
 ```
 
 
-# AAA
+# Abundance ratio
 ```{r}
 
 plot_data <- 
@@ -834,14 +843,17 @@ plot_data %>%
   geom_text() +
   theme_bw()
 
-plot_data %>% 
+plot_data2 <- 
+  plot_data %>% 
   group_by(seurat_clusters, marker) %>% 
   summarise(count = median(count)) %>% 
   spread(seurat_clusters, count) %>% 
   mutate(ratio = `0` / `1`,
          ratio2 = `1` / `0`) %>% 
   arrange(ratio) %>% 
-  mutate(marker = factor(marker, marker)) %>% 
+  mutate(marker = factor(marker, marker)) 
+
+plot_data2 %>% 
   ggplot(aes(ratio, marker, label = round(ratio, 1),
              fill = ratio >= 1)) +
   geom_col() +
@@ -863,6 +875,8 @@ ggsave("results/doublet/jurkat daudi dynamic range.png",
 ggsave("results/doublet/jurkat daudi dynamic range.pdf",
        width = 6, height = 9)
 
+plot_data2 %>% 
+  write_csv("results/doublet/Extended data figure 2C source.csv")
 
 
 ```
